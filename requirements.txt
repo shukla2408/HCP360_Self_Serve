@@ -1,0 +1,10 @@
+streamlit
+langchain
+langchain-openai 
+langchain-community 
+sqlalchemy 
+pyodbc
+psycopg2
+dotenv
+langsmith
+chromadb
