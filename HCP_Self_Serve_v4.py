@@ -36,7 +36,7 @@ from typing import Dict, List
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-
+from urllib.parse import quote_plus
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from langchain_community.utilities.sql_database import SQLDatabase
@@ -50,7 +50,7 @@ from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
 # NEW: for DataFrame fetch and charts
 from sqlalchemy import create_engine, text
 import altair as alt
-
+from sqlalchemy.exc import OperationalError
 # ---- Backwards-compatible examples import ----
 try:
     # Preferred: your new structure
@@ -359,7 +359,21 @@ def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: D
     )
     return vs
 
-
+def check_connection(uri: str) -> None:
+    try:
+        engine = create_engine(uri)
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+    except OperationalError as e:
+        msg = str(e.orig) if hasattr(e, "orig") else str(e)
+        if "password authentication failed" in msg.lower():
+            st.error("❌ Database login failed. Check user/password (and URL-encoding).")
+        elif "does not exist" in msg.lower() and "database" in msg.lower():
+            st.error("❌ Database name is wrong or missing in the URI.")
+        else:
+            st.error(f"❌ Could not connect to the database:\n{msg}")
+        st.stop()
+        
 def select_relevant_tables(schema_vs: Chroma, question: str, k_tables: int) -> List[str]:
     k_tables = max(1, int(k_tables))
     docs = schema_vs.similarity_search(question, k=k_tables)
@@ -456,8 +470,14 @@ def history_to_bullets(turns):
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    default_uri = "postgresql+psycopg2://postgres:1234@localhost:5432/hcp360_poc"
-    db_uri = st.text_input("SQLAlchemy DB URI", value=default_uri)
+    st.caption("Connection (Neon)")
+    user = st.text_input("User", value="neondb_owner")
+    password='npg_QcHFVEf4o9uA'
+    host = "ep-raspy-pond-a8p1p9je-pooler.eastus2.azure.neon.tech"
+    database = st.text_input("Database", value="neondb")
+    sslmode = "require"
+    db_uri = f"postgresql+psycopg2://{user}:{quote_plus(password)}@{host}/{database}?sslmode=require"
+   # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
     schema = st.text_input("Schema (optional)", value="dbo")
 
     st.caption("Candidate tables (leave BLANK to auto-discover ALL tables from DB)")
@@ -465,7 +485,7 @@ with st.sidebar:
         "One per line",
         value="",
         height=88,
-        placeholder="hcp360_persona\nhcp360_persona_segment\nhcp360_persona_scientific_studies\nhcp360_prd_rtl_sls\nhcp360_prsnl_engmnt\n",
+        placeholder="hcp360_persona\nhcp360_prsnl_engmnt\n",
     )
     candidate_tables = [t.strip() for t in include_tables_raw.splitlines() if t.strip()]
 
@@ -476,23 +496,23 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔎 Dynamic table selection")
-    k_tables = st.slider("Max tables to include", 1, 12, 4, 1)
-    rebuild_schema_index = st.button("Rebuild schema index (re-embed tables + descriptions)")
+    k_tables = st.slider("Max tables to include", 1, 2, 2, 1)
+    rebuild_schema_index = st.button("Rebuild schema index")
 
     st.divider()
     st.subheader("🧩 Few-shot examples")
     k_examples = st.slider("Examples to include (k)", min_value=0, max_value=8, value=5, step=1)
     rebuild_example_index = st.button("Rebuild example index")
 
-    st.divider()
-    st.caption("Auth")
-    api_key = st.text_input("OPENAI_API_KEY (optional if in env)", type="password")
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
+    # st.divider()
+    # st.caption("Auth")
+    # api_key = st.text_input("OPENAI_API_KEY (optional if in env)", type="password")
+    # if api_key:
+    #     os.environ["OPENAI_API_KEY"] = api_key
 
-    st.divider()
-    st.caption("Using table descriptions from CSV:")
-    st.code(CSV_PATH, language="bash")
+    # st.divider()
+    # st.caption("Using table descriptions from CSV:")
+    # st.code(CSV_PATH, language="bash")
 
     st.divider()
     if st.button("🗑️ Reset conversation"):
@@ -561,6 +581,7 @@ if prompt:
                 st.warning(f"No table descriptions loaded from {CSV_PATH}. Proceeding without descriptions.")
 
             # 1) Init DB & LLM
+            check_connection(db_uri)
             db = SQLDatabase.from_uri(db_uri, schema=schema or None)
             llm = ChatOpenAI(model=model, temperature=temperature)
 
