@@ -10,7 +10,7 @@ langchain-core==0.2.43
 langchain-community==0.2.16
 langchain-openai==0.1.23
 openai==1.40.0
-chromadb==0.5.5
+chromadb
 
 pydantic==2.8.2
 typing_extensions==4.12.2

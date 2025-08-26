@@ -71,7 +71,7 @@ st.markdown("<p style='text-align: center; font-size: 16px;'>Ask in natural lang
 
 
 # ---------------- Constants ----------------
-CSV_PATH = r"C:\HCP360\hcp360_table_descriptions.csv"   # ← fixed path you provided
+CSV_PATH = "hcp360_table_descriptions.csv"   # ← fixed path you provided
 EX_PERSIST_DIR = "chroma_examples"
 EX_COLLECTION = "sql_fewshot_examples"
 SCHEMA_PERSIST_DIR = "chroma_schema"
