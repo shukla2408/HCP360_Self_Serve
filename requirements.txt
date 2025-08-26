@@ -1,17 +1,17 @@
-streamlit
-pandas
-python-dotenv
-sqlalchemy
-psycopg2-binary
-altair
+streamlit==1.37.0
+pandas==2.2.2
+python-dotenv==1.0.1
+sqlalchemy==2.0.32
+psycopg2-binary==2.9.9
+altair==5.3.0
 
-langchain
-langchain-core
-langchain-community
-langchain-openai
-openai
-chromadb
+langchain==0.2.16
+langchain-core==0.2.43
+langchain-community==0.2.16
+langchain-openai==0.1.23
+openai==1.40.0
+chromadb==0.5.5
 
-pydantic
-typing_extensions
-tiktoken
+pydantic==2.8.2
+typing_extensions==4.12.2
+tiktoken==0.7.0
