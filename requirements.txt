@@ -5,8 +5,7 @@ python-dotenv
 altair
 
 # --- DB / SQL ---
-sqlalchemy
-psycopg[binary]    # psycopg v3, works with 3.13
+sqlalchemy   # psycopg v3, works with 3.13
 
 # --- LangChain stack ---
 langchain
