@@ -28,14 +28,6 @@ Requirements:
 
 from __future__ import annotations
 
-# --- Chroma/SQLite fix for Streamlit/hosted envs ---
-import sys
-try:
-    import pysqlite3  # provided by pysqlite3-binary
-    sys.modules["sqlite3"] = pysqlite3
-except Exception:
-    # If this fails, pysqlite3-binary likely didn't install
-    pass
 
 # --- Chroma/SQLite fix for Streamlit/hosted envs ---
 import sys
@@ -736,4 +728,5 @@ if prompt:
         except Exception as e:  # pragma: no cover
             with st.chat_message("assistant"):
                 st.exception(e)
+
 
