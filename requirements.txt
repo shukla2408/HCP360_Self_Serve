@@ -1,5 +1,5 @@
 streamlit
-pysqlite3-binary
+pysqlite3-binary==0.5.2.post3
 pandas
 python-dotenv
 sqlalchemy
@@ -14,5 +14,6 @@ chromadb
 pydantic
 typing_extensions
 tiktoken
+
 
 
