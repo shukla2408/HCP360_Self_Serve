@@ -3,8 +3,7 @@ pandas
 python-dotenv
 sqlalchemy
 psycopg2-binary
-altair
-
+altai
 langchain
 langchain-core
 langchain-community
