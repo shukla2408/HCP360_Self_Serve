@@ -1,18 +1,18 @@
 # app.py
 """
 Project: HCP360 NL→SQL Runner (Streamlit)
-Add-ons: Few-shot via Chroma + Dynamic Table Selection + CSV Table Descriptions (fixed path)
+Add-ons: Few-shot via FAISS + Dynamic Table Selection + CSV Table Descriptions (fixed path)
          Conversational follow-ups (question rewriter + context carryover)
          Chat-style UI (Streamlit chat messages)
          ➕ Visuals: interactive table, auto chart, CSV download
-Version: 2.2.0
+Version: 2.2.0 (FAISS)
 Maintainer: Debankit
 Python: 3.10+
 
 Summary:
   Streamlit UI to:
     (1) auto-discover or accept a list of candidate tables,
-    (2) load HUMAN table descriptions from a fixed CSV path and index them with schema in Chroma,
+    (2) load HUMAN table descriptions from a fixed CSV path and index them with schema in FAISS,
     (3) pick only the most relevant tables for the (possibly follow-up) question,
     (4) generate SQL via LangChain with few-shot examples,
     (5) execute via QuerySQLDataBaseTool,
@@ -22,22 +22,11 @@ Summary:
     (9) show visuals (interactive table + best-guess chart) and allow CSV download.
 
 Requirements:
-  pip install streamlit langchain langchain-community langchain-openai sqlalchemy psycopg2-binary python-dotenv chromadb pandas altair
+  pip install streamlit langchain langchain-community langchain-openai sqlalchemy psycopg2-binary python-dotenv faiss-cpu pandas altair
   Set OPENAI_API_KEY in env or via the sidebar.
 """
 
 from __future__ import annotations
-
-
-# --- Chroma/SQLite fix for Streamlit/hosted envs ---
-import sys
-try:
-    import pysqlite3  # provided by pysqlite3-binary
-    sys.modules["sqlite3"] = pysqlite3
-except Exception:
-    # If this fails, pysqlite3-binary likely didn't install
-    pass
-# ---------------------------------------------------
 
 import os
 import re
@@ -54,7 +43,7 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 from langchain.chains import create_sql_query_chain  # noqa: F401  (kept for reference)
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.prompts import FewShotPromptTemplate
 from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
 
@@ -62,6 +51,7 @@ from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
 from sqlalchemy import create_engine, text
 import altair as alt
 from sqlalchemy.exc import OperationalError
+
 # ---- Backwards-compatible examples import ----
 try:
     # Preferred: your new structure
@@ -83,10 +73,10 @@ st.markdown("<p style='text-align: center; font-size: 16px;'>Ask in natural lang
 
 # ---------------- Constants ----------------
 CSV_PATH = "hcp360_table_descriptions.csv"   # ← fixed path you provided
-EX_PERSIST_DIR = "chroma_examples"
-EX_COLLECTION = "sql_fewshot_examples"
-SCHEMA_PERSIST_DIR = "chroma_schema"
-SCHEMA_COLLECTION = "sql_schema_tables"
+EX_PERSIST_DIR = "faiss_examples"            # (renamed for clarity)
+EX_COLLECTION = "sql_fewshot_examples"       # unused with FAISS but kept for consistency in code comments
+SCHEMA_PERSIST_DIR = "faiss_schema"          # (renamed for clarity)
+SCHEMA_COLLECTION = "sql_schema_tables"      # unused with FAISS but kept for semantics
 
 
 # ---------------- Helpers ----------------
@@ -147,7 +137,7 @@ def get_desc_for(table: str, desc_map: Dict[str, str]) -> str:
     return lower_map.get(table.lower(), "")
 
 
-# ----------- NEW: DataFrame + Visual helpers -----------
+# ----------- NEW: DataFrame + Visual helpers -----------#
 def try_fetch_dataframe(sql: str, db_uri: str, max_rows: int = 500) -> pd.DataFrame | None:
     """
     Return a pandas DataFrame for the SQL (best-effort).
@@ -240,7 +230,8 @@ def render_visuals(df: pd.DataFrame) -> None:
 
     # If no suitable chart, quietly skip
 
-# ---------------- Few-shot Examples (Chroma) ----------------
+
+# ---------------- Few-shot Examples (FAISS) ----------------
 def get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings()
 
@@ -255,13 +246,26 @@ def build_example_selector(top_k_limit: int, k: int = 3) -> SemanticSimilarityEx
         if (ex.get("question") or ex.get("input")) and (ex.get("sql") or ex.get("query"))
     ]
     embeddings = get_embeddings()
-    vs = Chroma.from_texts(
-        texts=[f"{ex['question']}\n{ex['sql']}" for ex in formatted],
-        metadatas=formatted,
-        embedding=embeddings,
-        persist_directory=EX_PERSIST_DIR,
-        collection_name=EX_COLLECTION,
-    )
+
+    # Try to load existing FAISS index first
+    vs = None
+    if os.path.exists(EX_PERSIST_DIR):
+        try:
+            vs = FAISS.load_local(
+                EX_PERSIST_DIR,
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+        except Exception:
+            shutil.rmtree(EX_PERSIST_DIR, ignore_errors=True)
+
+    # Build fresh if needed
+    if vs is None:
+        texts = [f"{ex['question']}\n{ex['sql']}" for ex in formatted]
+        vs = FAISS.from_texts(texts=texts, metadatas=formatted, embedding=embeddings)
+        os.makedirs(EX_PERSIST_DIR, exist_ok=True)
+        vs.save_local(EX_PERSIST_DIR)
+
     selector = SemanticSimilarityExampleSelector(
         vectorstore=vs,
         k=max(0, int(k)),
@@ -325,7 +329,7 @@ def build_sql_prompt_with_examples(selector: SemanticSimilarityExampleSelector) 
     )
 
 
-# ---------------- Schema Index (Dynamic Table Selection) ----------------
+# ---------------- Schema Index (Dynamic Table Selection via FAISS) ----------------
 def discover_tables(db: SQLDatabase, candidate_tables: List[str] | None) -> List[str]:
     if candidate_tables:
         return candidate_tables
@@ -335,21 +339,24 @@ def discover_tables(db: SQLDatabase, candidate_tables: List[str] | None) -> List
         return []
 
 
-def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: Dict[str, str], rebuild: bool = False) -> Chroma:
+def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: Dict[str, str], rebuild: bool = False):
     embeddings = get_embeddings()
-    if rebuild and os.path.exists(SCHEMA_PERSIST_DIR):
-        shutil.rmtree(SCHEMA_PERSIST_DIR)
 
+    if rebuild and os.path.exists(SCHEMA_PERSIST_DIR):
+        shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
+
+    # If a saved FAISS index exists, try to load it
     if os.path.exists(SCHEMA_PERSIST_DIR) and not rebuild:
         try:
-            return Chroma(
-                collection_name=SCHEMA_COLLECTION,
-                persist_directory=SCHEMA_PERSIST_DIR,
-                embedding_function=embeddings,
+            return FAISS.load_local(
+                SCHEMA_PERSIST_DIR,
+                embeddings,
+                allow_dangerous_deserialization=True,
             )
         except Exception:
-            shutil.rmtree(SCHEMA_PERSIST_DIR)
+            shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
 
+    # Build fresh
     texts, metas = [], []
     for t in table_names:
         try:
@@ -361,14 +368,15 @@ def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: D
         except Exception:
             continue
 
-    vs = Chroma.from_texts(
+    vs = FAISS.from_texts(
         texts=texts or [""],
-        embedding=embeddings,
         metadatas=metas or None,
-        persist_directory=SCHEMA_PERSIST_DIR,
-        collection_name=SCHEMA_COLLECTION,
+        embedding=embeddings,
     )
+    os.makedirs(SCHEMA_PERSIST_DIR, exist_ok=True)
+    vs.save_local(SCHEMA_PERSIST_DIR)
     return vs
+
 
 def check_connection(uri: str) -> None:
     try:
@@ -384,8 +392,9 @@ def check_connection(uri: str) -> None:
         else:
             st.error(f"❌ Could not connect to the database:\n{msg}")
         st.stop()
-        
-def select_relevant_tables(schema_vs: Chroma, question: str, k_tables: int) -> List[str]:
+
+
+def select_relevant_tables(schema_vs, question: str, k_tables: int) -> List[str]:
     k_tables = max(1, int(k_tables))
     docs = schema_vs.similarity_search(question, k=k_tables)
     ordered: List[str] = []
@@ -488,7 +497,7 @@ with st.sidebar:
     database = st.text_input("Database", value="neondb")
     sslmode = "require"
     db_uri = f"postgresql+psycopg2://{user}:{quote_plus(password)}@{host}/{database}?sslmode=require"
-   # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
+    # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
     schema = st.text_input("Schema (optional)", value="dbo")
 
     st.caption("Candidate tables (leave BLANK to auto-discover ALL tables from DB)")
@@ -514,16 +523,6 @@ with st.sidebar:
     st.subheader("🧩 Few-shot examples")
     k_examples = st.slider("Examples to include (k)", min_value=0, max_value=8, value=5, step=1)
     rebuild_example_index = st.button("Rebuild example index")
-
-    # st.divider()
-    # st.caption("Auth")
-    # api_key = st.text_input("OPENAI_API_KEY (optional if in env)", type="password")
-    # if api_key:
-    #     os.environ["OPENAI_API_KEY"] = api_key
-
-    # st.divider()
-    # st.caption("Using table descriptions from CSV:")
-    # st.code(CSV_PATH, language="bash")
 
     st.divider()
     if st.button("🗑️ Reset conversation"):
@@ -603,9 +602,9 @@ if prompt:
                     st.error("No tables discovered. Provide candidate tables or verify schema/permissions.")
                 st.stop()
 
-            # 3) Build/load schema index
+            # 3) Build/load schema index (FAISS)
             if rebuild_schema_index and os.path.exists(SCHEMA_PERSIST_DIR):
-                shutil.rmtree(SCHEMA_PERSIST_DIR)
+                shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
             schema_vs = build_or_load_schema_vs(db, all_candidates, desc_map, rebuild=False)
 
             # 4) Rewrite if follow-up
@@ -641,7 +640,7 @@ if prompt:
 
             # 6) Few-shot + SQL generation
             if rebuild_example_index and os.path.exists(EX_PERSIST_DIR):
-                shutil.rmtree(EX_PERSIST_DIR)
+                shutil.rmtree(EX_PERSIST_DIR, ignore_errors=True)
             selector = build_example_selector(top_k_limit=int(top_k), k=k_examples)
             custom_prompt = build_sql_prompt_with_examples(selector)
 
@@ -728,5 +727,3 @@ if prompt:
         except Exception as e:  # pragma: no cover
             with st.chat_message("assistant"):
                 st.exception(e)
-
-
