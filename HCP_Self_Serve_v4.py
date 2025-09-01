@@ -34,6 +34,8 @@ import os
 import re
 import shutil
 from typing import Dict, List
+import json
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -250,6 +252,60 @@ def render_visuals(df: pd.DataFrame) -> None:
     # If no suitable chart, quietly skip
 
 
+# ----------- Schema Introspection + Self-heal helpers -----------#
+def build_columns_index(db_uri: str, schema: str | None, tables: List[str]) -> dict[str, set[str]]:
+    """Return {table: set(column names in various cases)} for quick existence checks."""
+    index: dict[str, set[str]] = {}
+    try:
+        engine = create_engine(db_uri)
+        insp = inspect(engine)
+        for t in tables:
+            cols: list[dict] = []
+            try:
+                cols = insp.get_columns(t, schema=(schema or None))
+            except Exception:
+                # best-effort; skip on failure
+                cols = []
+            names = {c.get("name", "") for c in cols if c.get("name")}
+            variants: set[str] = set()
+            for n in names:
+                variants.update({n, n.lower(), n.upper()})
+            index[t] = variants
+    except Exception:
+        pass
+    return index
+
+
+def find_tables_with_column(index: dict[str, set[str]], col: str) -> List[str]:
+    """Case-insensitive find of tables containing a column name."""
+    if not col:
+        return []
+    needles = {col, col.lower(), col.upper()}
+    out: List[str] = []
+    for t, cols in index.items():
+        if any(n in cols for n in needles):
+            out.append(t)
+    return out
+
+
+def suggest_join_keys(index: dict[str, set[str]], tables: List[str]) -> List[str]:
+    """Suggest plausible join keys by intersecting common columns and prioritizing typical ID fields."""
+    if not tables:
+        return []
+    inter: set[str] | None = None
+    for t in tables:
+        cols = {c.lower() for c in index.get(t, set())}
+        inter = cols if inter is None else inter & cols
+    inter = inter or set()
+    priority = [
+        "pres_eid", "hcp_eid", "hcp_id", "prescriber_id", "npi", "eid", "id",
+    ]
+    ordered = [k for k in priority if k in inter]
+    if not ordered:
+        ordered = sorted(list(inter))[:3]
+    return ordered
+
+
 # ---------------- Few-shot Examples (FAISS) ----------------
 def get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings()
@@ -320,6 +376,7 @@ def build_sql_prompt_with_examples(selector: SemanticSimilarityExampleSelector) 
         "8) Use {dialect}-compatible syntax only (no vendor-specific functions not supported by {dialect}).\n"
         "9) For aggregations, include proper GROUP BY clauses for all non-aggregated selected columns.\n"
         "10) If a filter is requested with free text (e.g., name matching), use safe, schema-backed columns only; avoid brittle string concatenations unless present in table_info.\n"
+        "11) When the question narrows a 'universe' or filter using one table (e.g., engagements), but requires attributes stored in another table (e.g., demographics), JOIN the relevant tables using keys in table_info (e.g., pres_eid) instead of assuming the attribute exists in the filtered table.\n"
         "\n"
         "PROCESS TO FOLLOW WHEN CREATING THE QUERY:\n"
         "A) Identify the minimal set of ALLOWED TABLES needed to answer the question.\n"
@@ -351,16 +408,42 @@ def build_sql_prompt_with_examples(selector: SemanticSimilarityExampleSelector) 
 
 # ---------------- Schema Index (Dynamic Table Selection via FAISS) ----------------
 def discover_tables(db: SQLDatabase, candidate_tables: List[str] | None) -> List[str]:
-    if candidate_tables:
-        return candidate_tables
+    """Return only tables that actually exist in the connected DB/schema.
+
+    - If candidate_tables provided, intersect with live DB tables; if none remain, fall back to all tables.
+    - If no candidates provided, return all usable tables.
+    """
     try:
-        return sorted(list(db.get_usable_table_names()))
+        actual = set(db.get_usable_table_names())
     except Exception:
-        return []
+        actual = set()
+    if candidate_tables:
+        filtered = [t for t in candidate_tables if t in actual]
+        return sorted(filtered) if filtered else sorted(list(actual))
+    return sorted(list(actual))
 
 
-def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: Dict[str, str], rebuild: bool = False):
+def _safe_conn_fingerprint(db_uri: str, schema: str | None, table_names: List[str]) -> str:
+    """Create a reproducible fingerprint that ignores credentials but ties to DB host/db/schema and tables."""
+    try:
+        # crude parse to mask password while keeping host/db
+        masked = re.sub(r"://([^:]+):([^@]+)@", r"://\\1:***@", db_uri)
+    except Exception:
+        masked = db_uri
+    payload = json.dumps({
+        "db": masked,
+        "schema": schema or "",
+        "tables": sorted(list(set(table_names))),
+    }, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: Dict[str, str], rebuild: bool = False, *, db_uri: str = "", schema: str | None = None):
     embeddings = get_embeddings()
+
+    # Connection-aware cache fingerprint
+    fp_new = _safe_conn_fingerprint(db_uri or "", schema, table_names)
+    fp_file = os.path.join(SCHEMA_PERSIST_DIR, ".fingerprint")
 
     if rebuild and os.path.exists(SCHEMA_PERSIST_DIR):
         shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
@@ -368,11 +451,19 @@ def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: D
     # If a saved FAISS index exists, try to load it
     if os.path.exists(SCHEMA_PERSIST_DIR) and not rebuild:
         try:
-            return FAISS.load_local(
-                SCHEMA_PERSIST_DIR,
-                embeddings,
-                allow_dangerous_deserialization=True,
-            )
+            fp_old = ""
+            if os.path.exists(fp_file):
+                with open(fp_file, "r", encoding="utf-8") as f:
+                    fp_old = (f.read() or "").strip()
+            if fp_old == fp_new:
+                return FAISS.load_local(
+                    SCHEMA_PERSIST_DIR,
+                    embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+            else:
+                # fingerprint mismatch → rebuild
+                shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
         except Exception:
             shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
 
@@ -395,6 +486,11 @@ def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: D
     )
     os.makedirs(SCHEMA_PERSIST_DIR, exist_ok=True)
     vs.save_local(SCHEMA_PERSIST_DIR)
+    try:
+        with open(fp_file, "w", encoding="utf-8") as f:
+            f.write(fp_new)
+    except Exception:
+        pass
     return vs
 
 
@@ -753,11 +849,27 @@ show_visuals = st.toggle("Show visuals (table + chart)", value=True)
 st.divider()
 
 # Render past conversation as chat bubbles
-for turn in st.session_state["history"]:
+for i, turn in enumerate(st.session_state["history"], 1):
     st.chat_message("user").write(turn.get("question", ""))
 
     with st.chat_message("assistant"):
         st.write(turn.get("nl_answer", ""))
+
+        # Visuals for past turns (persist tables/charts)
+        if show_visuals:
+            hist_df = turn.get("df")
+            if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+                with st.expander("Visuals", expanded=False):
+                    render_visuals(hist_df)
+                    csv_bytes = hist_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download these rows as CSV",
+                        data=csv_bytes,
+                        file_name=f"query_result_{i}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"dl_hist_{i}",
+                    )
 
         # Nice collapsible details per assistant turn
         with st.expander("Details"):
@@ -813,7 +925,7 @@ if prompt:
             # 3) Build/load schema index (FAISS)
             if rebuild_schema_index and os.path.exists(SCHEMA_PERSIST_DIR):
                 shutil.rmtree(SCHEMA_PERSIST_DIR, ignore_errors=True)
-            schema_vs = build_or_load_schema_vs(db, all_candidates, desc_map, rebuild=False)
+            schema_vs = build_or_load_schema_vs(db, all_candidates, desc_map, rebuild=False, db_uri=db_uri, schema=schema)
 
             # 4) Rewrite if follow-up
             standalone_question = question
@@ -845,6 +957,19 @@ if prompt:
                 with st.chat_message("assistant"):
                     st.error("Could not select relevant tables for the question.")
                 st.stop()
+
+            # Guard: if selection includes tables not present in the current DB, rebuild index and retry once
+            try:
+                actual_tables = set(db.get_usable_table_names())
+            except Exception:
+                actual_tables = set()
+            if any(t not in actual_tables for t in selected_tables):
+                schema_vs = build_or_load_schema_vs(db, list(actual_tables), desc_map, rebuild=True, db_uri=db_uri, schema=schema)
+                selected_tables = select_relevant_tables(schema_vs, standalone_question, k_tables)
+                if not selected_tables:
+                    with st.chat_message("assistant"):
+                        st.error("Table selection failed after index rebuild; verify DB connection and schema.")
+                    st.stop()
 
             # 6) Few-shot + SQL generation
             if rebuild_example_index and os.path.exists(EX_PERSIST_DIR):
@@ -886,10 +1011,80 @@ if prompt:
                 st.stop()
 
             execute_query = QuerySQLDataBaseTool(db=db)
-            result_str = execute_query.invoke(sql_to_run)
+            try:
+                result_str = execute_query.invoke(sql_to_run)
+                # NEW: try to fetch a tabular result for visuals (best-effort)
+                df = try_fetch_dataframe(sql_to_run, db_uri)
+            except Exception as exec_err:
+                # Attempt a targeted self-heal for missing-column mistakes
+                msg = str(exec_err)
+                missing_col = None
+                missing_table = None
+                m = re.search(r"column\s+\"?([A-Za-z0-9_]+)\"?\s+does not exist", msg, flags=re.IGNORECASE)
+                if not m:
+                    m = re.search(r"column\s+([A-Za-z0-9_\.]+)\s+does not exist", msg, flags=re.IGNORECASE)
+                if m:
+                    missing_col = m.group(1).split(".")[-1]
 
-            # NEW: try to fetch a tabular result for visuals (best-effort)
-            df = try_fetch_dataframe(sql_to_run, db_uri)
+                # Detect missing relation/table
+                mt = re.search(r"relation\s+\"?([A-Za-z0-9_\.]+)\"?\s+does not exist", msg, flags=re.IGNORECASE)
+                if not mt:
+                    mt = re.search(r"table\s+\"?([A-Za-z0-9_\.]+)\"?\s+does not exist", msg, flags=re.IGNORECASE)
+                if mt:
+                    missing_table = mt.group(1)
+
+                healed = False
+                if missing_col:
+                    cols_index = build_columns_index(db_uri, schema or None, all_candidates)
+                    src_tables = find_tables_with_column(cols_index, missing_col)
+                    # If we can locate the column in other tables, expand selection and retry with a hint
+                    if src_tables:
+                        join_hints = suggest_join_keys(cols_index, list(set(src_tables + selected_tables)))
+                        selected_tables = list(dict.fromkeys(selected_tables + src_tables))
+
+                        # Rebuild table_info with expanded tables
+                        if include_rich_table_info:
+                            table_info = build_rich_table_info(db_uri, schema, selected_tables)
+                        else:
+                            table_info = _cap(db.get_table_info(table_names=selected_tables), MAX_TABLEINFO_CHARS)
+
+                        hint = (
+                            f"Note: Column {missing_col} exists in: {', '.join(src_tables)}. "
+                            f"JOIN tables using keys like: {', '.join(join_hints) if join_hints else 'refer table_info'}; "
+                            f"do not reference {missing_col} from unrelated tables."
+                        )
+                        manual_inputs["question"] = f"{standalone_question}\n{hint}"
+                        manual_inputs["table_info"] = table_info
+
+                        sql_raw = sql_generator.invoke(manual_inputs)
+                        sql_to_run = clean_sql(sql_raw) or sql_raw
+                        if enforce_select_only and not is_select_only(sql_to_run):
+                            raise exec_err
+
+                        # Retry execution
+                        result_str = execute_query.invoke(sql_to_run)
+                        df = try_fetch_dataframe(sql_to_run, db_uri)
+                        healed = True
+
+                # If a table/relation was missing, force the model to use only allowed tables
+                if (not healed) and missing_table:
+                    allowed = ", ".join(selected_tables)
+                    hint = (
+                        f"Note: Table {missing_table} does not exist. Use only these ALLOWED TABLES: {allowed}. "
+                        f"If needed, JOIN among them using keys from table_info."
+                    )
+                    manual_inputs["question"] = f"{standalone_question}\n{hint}"
+                    sql_raw = sql_generator.invoke(manual_inputs)
+                    sql_to_run = clean_sql(sql_raw) or sql_raw
+                    if enforce_select_only and not is_select_only(sql_to_run):
+                        raise exec_err
+                    result_str = execute_query.invoke(sql_to_run)
+                    df = try_fetch_dataframe(sql_to_run, db_uri)
+                    healed = True
+
+                if not healed:
+                    # If we couldn't heal, re-raise original error to display
+                    raise
 
             # 8) NL rephrase (with token-safety and graceful retry)
             safe_result_str = _cap(result_str, MAX_RESULT_CHARS)
@@ -942,7 +1137,7 @@ if prompt:
                     with st.expander("Raw DB result"):
                         st.text(result_str)
 
-            # 10) Persist turn
+            # 10) Persist turn (store DataFrame for visuals to keep prior charts/tables visible)
             st.session_state["history"].append({
                 "question": question,
                 "standalone_question": standalone_question,
@@ -950,6 +1145,7 @@ if prompt:
                 "sql": sql_to_run,
                 "result": result_str,
                 "selected_tables": selected_tables,
+                "df": df,
             })
 
         except Exception as e:  # pragma: no cover
