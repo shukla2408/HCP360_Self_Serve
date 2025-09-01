@@ -77,6 +77,7 @@ st.markdown("<p style='text-align: center; font-size: 16px;'>Ask in natural lang
 
 # ---------------- Constants ----------------
 CSV_PATH = "hcp360_table_descriptions.csv"   # ← fixed path you provided
+EXCEL_PATH = "HCP 360 data description.xlsx"  # optional Excel source
 EX_PERSIST_DIR = "faiss_examples"            # (renamed for clarity)
 EX_COLLECTION = "sql_fewshot_examples"       # unused with FAISS but kept for consistency in code comments
 SCHEMA_PERSIST_DIR = "faiss_schema"          # (renamed for clarity)
@@ -156,6 +157,43 @@ def get_desc_for(table: str, desc_map: Dict[str, str]) -> str:
         return desc_map[table]
     lower_map = {k.lower(): v for k, v in desc_map.items()}
     return lower_map.get(table.lower(), "")
+
+
+def load_table_descriptions_from_excel(path: str) -> Dict[str, str]:
+    """
+    Load Excel with columns: table, description (first sheet by default).
+    Returns dict {table_name: description}. If not found or malformed, returns {}.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_excel(path)
+    except Exception:
+        return {}
+    cols = {c.lower().strip(): c for c in df.columns}
+    tcol = cols.get("table") or cols.get("name") or cols.get("table_name")
+    dcol = cols.get("description") or cols.get("desc")
+    if not tcol or not dcol:
+        return {}
+    desc_map: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        t = str(row[tcol]).strip()
+        d = str(row[dcol]).strip()
+        if t:
+            desc_map[t] = d
+    return desc_map
+
+
+def load_table_descriptions(csv_path: str, excel_path: str) -> Dict[str, str]:
+    """Load from both CSV and Excel, merge. Excel entries override CSV on conflicts."""
+    csv_desc = load_table_descriptions_from_csv(csv_path) if csv_path else {}
+    xls_desc = load_table_descriptions_from_excel(excel_path) if excel_path else {}
+    if not csv_desc and not xls_desc:
+        return {}
+    # merge with Excel taking precedence
+    merged = dict(csv_desc)
+    merged.update(xls_desc)
+    return merged
 
 
 # ----------- NEW: DataFrame + Visual helpers -----------#
@@ -311,16 +349,49 @@ def get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings()
 
 
-def build_example_selector(top_k_limit: int, k: int = 3) -> SemanticSimilarityExampleSelector:
+def _extract_tables_from_sql(sql: str) -> set[str]:
+    """Best-effort extraction of table names from FROM/JOIN clauses.
+    Returns bare table names without schema/quotes.
+    """
+    tables: set[str] = set()
+    if not sql:
+        return tables
+    try:
+        pattern = re.compile(r"\b(from|join)\s+([a-zA-Z0-9_\.\"`]+)", re.IGNORECASE)
+        for _, ident in pattern.findall(sql):
+            # strip alias if present later
+            ident = ident.strip()
+            ident = ident.strip('`"')
+            # skip subqueries
+            if ident.startswith("("):
+                continue
+            # take last segment after schema dot if any
+            name = ident.split(".")[-1].strip('`"')
+            if name:
+                tables.add(name)
+    except Exception:
+        pass
+    return tables
+
+
+def build_example_selector(top_k_limit: int, k: int = 3, allowed_tables: List[str] | None = None) -> SemanticSimilarityExampleSelector:
+    allowed = {t.lower() for t in (allowed_tables or [])}
     formatted = []
     for ex in SQL_EXAMPLES:
         q = ex.get("question") or ex.get("input", "")
         s = (ex.get("sql") or ex.get("query", "")).replace("{top_k}", str(top_k_limit))
-        if q and s:
-            # trim example payload to keep token usage bounded
-            q = _cap(q, MAX_EXAMPLE_CHARS // 2)
-            s = _cap(s, MAX_EXAMPLE_CHARS // 2)
-            formatted.append({"question": q, "sql": s})
+        if not (q and s):
+            continue
+        # Filter out examples that reference tables not present in the DB
+        if allowed:
+            mentioned = {t.lower() for t in _extract_tables_from_sql(s)}
+            # keep only if every mentioned table is in allowed set
+            if mentioned and not mentioned.issubset(allowed):
+                continue
+        # trim example payload to keep token usage bounded
+        q = _cap(q, MAX_EXAMPLE_CHARS // 2)
+        s = _cap(s, MAX_EXAMPLE_CHARS // 2)
+        formatted.append({"question": q, "sql": s})
     embeddings = get_embeddings()
 
     # Try to load existing FAISS index first
@@ -904,10 +975,12 @@ if prompt:
         pass
     else:
         try:
-            # 0) Load CSV descriptions
-            desc_map = load_table_descriptions_from_csv(CSV_PATH)
+            # 0) Load descriptions from CSV + Excel (Excel wins on conflicts)
+            desc_map = load_table_descriptions(CSV_PATH, EXCEL_PATH)
             if not desc_map:
-                st.warning(f"No table descriptions loaded from {CSV_PATH}. Proceeding without descriptions.")
+                st.warning(
+                    "No table descriptions loaded from CSV/Excel. Proceeding without descriptions."
+                )
 
             # 1) Init DB & LLM
             check_connection(db_uri)
@@ -974,7 +1047,7 @@ if prompt:
             # 6) Few-shot + SQL generation
             if rebuild_example_index and os.path.exists(EX_PERSIST_DIR):
                 shutil.rmtree(EX_PERSIST_DIR, ignore_errors=True)
-            selector = build_example_selector(top_k_limit=int(top_k), k=k_examples)
+            selector = build_example_selector(top_k_limit=int(top_k), k=k_examples, allowed_tables=all_candidates)
             custom_prompt = build_sql_prompt_with_examples(selector)
 
             dialect = "PostgreSQL"
