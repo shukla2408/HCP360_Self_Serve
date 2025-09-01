@@ -5,7 +5,8 @@ Add-ons: Few-shot via FAISS + Dynamic Table Selection + CSV Table Descriptions (
          Conversational follow-ups (question rewriter + context carryover)
          Chat-style UI (Streamlit chat messages)
          ➕ Visuals: interactive table, auto chart, CSV download
-Version: 2.2.0 (FAISS)
+         ➕ Rich table_info context (columns/types/PK-FK/comments/sample values/row est.)
+Version: 2.3.0 (FAISS + Rich Table Info + Token Safety)
 Maintainer: Debankit
 Python: 3.10+
 
@@ -19,7 +20,8 @@ Summary:
     (6) produce a concise business-stakeholder NL answer,
     (7) maintain conversation so users can ask follow-ups "with respect to" prior answers,
     (8) present a chat-style interface (user and assistant bubbles),
-    (9) show visuals (interactive table + best-guess chart) and allow CSV download.
+    (9) show visuals (interactive table + best-guess chart) and allow CSV download,
+   (10) include compact, rich table metadata to improve SQL quality without blowing context.
 
 Requirements:
   pip install streamlit langchain langchain-community langchain-openai sqlalchemy psycopg2-binary python-dotenv faiss-cpu pandas altair
@@ -48,7 +50,7 @@ from langchain.prompts import FewShotPromptTemplate
 from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
 
 # NEW: for DataFrame fetch and charts
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 import altair as alt
 from sqlalchemy.exc import OperationalError
 
@@ -78,8 +80,25 @@ EX_COLLECTION = "sql_fewshot_examples"       # unused with FAISS but kept for co
 SCHEMA_PERSIST_DIR = "faiss_schema"          # (renamed for clarity)
 SCHEMA_COLLECTION = "sql_schema_tables"      # unused with FAISS but kept for semantics
 
+# ---- NEW: prompt safety budgets ----
+MAX_RESULT_CHARS = 6000       # cap raw DB result string fed to NL rephraser
+MAX_TABLE_NOTES_CHARS = 2000  # cap human CSV notes block
+MAX_HISTORY_CHARS = 1200      # cap context sent to follow-up rewriter
+MAX_EXAMPLE_CHARS = 1000      # cap each few-shot example (q+sql total)
+MAX_TABLEINFO_CHARS = 6000    # cap the entire table_info block sent to the LLM
+MAX_PER_TABLE_CHARS = 2000    # cap info per table
+
+SAMPLE_ROWS_FOR_PROFILE = 5         # how many rows to peek for sample values in rich table info
+SAMPLE_VALUES_PER_COLUMN = 3        # how many example values to show per column
+INCLUDE_SAMPLE_VALUES = True        # flip False for leaner prompts
+
 
 # ---------------- Helpers ----------------
+def _cap(s: str, n: int) -> str:
+    s = s or ""
+    return (s[:n] + " …") if len(s) > n else s
+
+
 def clean_sql(s: str | None) -> str:
     """Extract a runnable single SQL statement from LLM output (strip code fences, comments, trailing semicolons)."""
     if not s:
@@ -237,14 +256,15 @@ def get_embeddings() -> OpenAIEmbeddings:
 
 
 def build_example_selector(top_k_limit: int, k: int = 3) -> SemanticSimilarityExampleSelector:
-    formatted = [
-        {
-            "question": ex.get("question") or ex.get("input", ""),
-            "sql": (ex.get("sql") or ex.get("query", "")).replace("{top_k}", str(top_k_limit)),
-        }
-        for ex in SQL_EXAMPLES
-        if (ex.get("question") or ex.get("input")) and (ex.get("sql") or ex.get("query"))
-    ]
+    formatted = []
+    for ex in SQL_EXAMPLES:
+        q = ex.get("question") or ex.get("input", "")
+        s = (ex.get("sql") or ex.get("query", "")).replace("{top_k}", str(top_k_limit))
+        if q and s:
+            # trim example payload to keep token usage bounded
+            q = _cap(q, MAX_EXAMPLE_CHARS // 2)
+            s = _cap(s, MAX_EXAMPLE_CHARS // 2)
+            formatted.append({"question": q, "sql": s})
     embeddings = get_embeddings()
 
     # Try to load existing FAISS index first
@@ -416,6 +436,185 @@ def build_table_notes(selected_tables: List[str], desc_map: Dict[str, str]) -> s
     return "\n".join(lines) if lines else "(no descriptions provided)"
 
 
+# ---------------- Rich table info (compact Postgres metadata) ----------------
+def _pg_estimated_rows(conn, schema: str, table: str) -> int | None:
+    q = text("""
+        SELECT CASE WHEN relpages = 0 THEN NULL
+                    ELSE (reltuples/NULLIF(relpages,0))::float8 * relpages END AS est_rows
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = :schema AND c.relname = :table
+    """)
+    try:
+        r = conn.execute(q, {"schema": schema, "table": table}).fetchone()
+        return int(r[0]) if r and r[0] is not None else None
+    except Exception:
+        return None
+
+
+def _pg_table_comment(conn, schema: str, table: str) -> str:
+    q = text("""
+        SELECT obj_description(c.oid) AS comment
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = :schema AND c.relname = :table
+    """)
+    try:
+        r = conn.execute(q, {"schema": schema, "table": table}).fetchone()
+        return (r[0] or "").strip() if r and r[0] else ""
+    except Exception:
+        return ""
+
+
+def _pg_column_comments(conn, schema: str, table: str) -> dict[str, str]:
+    q = text("""
+        SELECT a.attname AS col, pgd.description AS comment
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        LEFT JOIN pg_description pgd ON pgd.objoid = c.oid AND pgd.objsubid = a.attnum
+        WHERE n.nspname = :schema AND c.relname = :table
+    """)
+    out = {}
+    try:
+        for col, comment in conn.execute(q, {"schema": schema, "table": table}):
+            if comment:
+                out[col] = str(comment).strip()
+    except Exception:
+        pass
+    return out
+
+
+def _pg_primary_keys(conn, schema: str, table: str) -> list[str]:
+    q = text("""
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON kcu.constraint_name = tc.constraint_name
+         AND kcu.table_schema = tc.table_schema
+        WHERE tc.table_schema = :schema AND tc.table_name = :table AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+    """)
+    try:
+        return [r[0] for r in conn.execute(q, {"schema": schema, "table": table}).fetchall()]
+    except Exception:
+        return []
+
+
+def _pg_foreign_keys(conn, schema: str, table: str) -> list[tuple[str, str, str]]:
+    # returns [(local_col, ref_table, ref_col), ...]
+    q = text("""
+        SELECT
+          kcu.column_name AS col,
+          ccu.table_name  AS ref_table,
+          ccu.column_name AS ref_col
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON kcu.constraint_name = tc.constraint_name
+         AND kcu.table_schema = tc.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+          ON ccu.constraint_name = tc.constraint_name
+         AND ccu.table_schema = tc.table_schema
+        WHERE tc.table_schema = :schema AND tc.table_name = :table AND tc.constraint_type = 'FOREIGN KEY'
+        ORDER BY kcu.ordinal_position
+    """)
+    try:
+        return [(r[0], r[1], r[2]) for r in conn.execute(q, {"schema": schema, "table": table}).fetchall()]
+    except Exception:
+        return []
+
+
+def _format_table_summary(conn, engine, schema: str, table: str) -> str:
+    insp = inspect(engine)
+    cols = insp.get_columns(table, schema=schema)  # [{'name','type','nullable',...}]
+
+    col_comments = _pg_column_comments(conn, schema, table)
+    pks = _pg_primary_keys(conn, schema, table)
+    fks = _pg_foreign_keys(conn, schema, table)
+    tbl_comment = _pg_table_comment(conn, schema, table)
+    est_rows = _pg_estimated_rows(conn, schema, table)
+
+    # Sample a few rows (fast and capped)
+    sample_df = None
+    if INCLUDE_SAMPLE_VALUES and SAMPLE_ROWS_FOR_PROFILE > 0:
+        try:
+            sql = text(f'SELECT * FROM "{schema}"."{table}" LIMIT {SAMPLE_ROWS_FOR_PROFILE}')
+            sample_df = pd.read_sql_query(sql, conn)
+        except Exception:
+            sample_df = None
+
+    lines = []
+    header = f"Table: {table}"
+    if est_rows is not None:
+        header += f"  (~{est_rows:,} rows est.)"
+    lines.append(header)
+    if tbl_comment:
+        lines.append(f"Comment: {tbl_comment}")
+
+    # Columns
+    lines.append("Columns:")
+    for c in cols:
+        name = c.get("name")
+        dtype = str(c.get("type"))
+        nullable = "NULL" if c.get("nullable") else "NOT NULL"
+        cmt = col_comments.get(name, "")
+        col_line = f"  - {name}: {dtype}, {nullable}"
+        if cmt:
+            col_line += f" — {cmt}"
+        # sample values (compact)
+        if sample_df is not None and name in sample_df.columns:
+            try:
+                vals = (
+                    sample_df[name]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )[:SAMPLE_VALUES_PER_COLUMN]
+                if vals:
+                    col_line += f" (eg: {', '.join(vals)})"
+            except Exception:
+                pass
+        lines.append(col_line)
+
+    # Keys/relationships
+    if pks:
+        lines.append("Primary key: " + ", ".join(pks))
+    if fks:
+        rels = [f"{lc} → {rt}.{rc}" for lc, rt, rc in fks]
+        lines.append("Foreign keys: " + "; ".join(rels))
+
+    summary = "\n".join(lines)
+    return _cap(summary, MAX_PER_TABLE_CHARS)
+
+
+def build_rich_table_info(db_uri: str, schema: str | None, tables: list[str]) -> str:
+    schema = schema or "public"
+    try:
+        engine = create_engine(db_uri)
+        with engine.connect() as conn:
+            parts = []
+            for t in tables:
+                try:
+                    parts.append(_format_table_summary(conn, engine, schema, t))
+                except Exception:
+                    # fall back to basic info from LangChain if one table fails
+                    try:
+                        db = SQLDatabase.from_uri(db_uri, schema=schema, sample_rows_in_table_info=0)
+                        parts.append(db.get_table_info(table_names=[t]))
+                    except Exception:
+                        parts.append(f"Table: {t}\n(no metadata available)")
+            blob = "\n\n".join(parts)
+            return _cap(blob, MAX_TABLEINFO_CHARS)
+    except Exception:
+        # absolute fallback: LangChain’s default (already trimmed elsewhere)
+        try:
+            db = SQLDatabase.from_uri(db_uri, schema=schema, sample_rows_in_table_info=0)
+            return _cap(db.get_table_info(table_names=tables), MAX_TABLEINFO_CHARS)
+        except Exception:
+            return ""
+
+
 # ---------------- NL Answer Prompt (business stakeholder) ----------------
 answer_prompt = PromptTemplate.from_template(
     """You are given a user question, a SQL query (for context only), and the SQL result. 
@@ -477,16 +676,20 @@ def history_to_bullets(turns):
     if not turns:
         return "None."
     lines = []
+    used = 0
     for i, t in enumerate(turns, 1):
         q = (t.get("question") or "").strip()
         a = (t.get("nl_answer") or "").strip()
-        if len(a) > 500:
-            a = a[:500] + " ..."
-        lines.append(f"{i}. Q: {q}\n   A: {a}")
-    return "\n".join(lines) if lines else "None."
+        a = _cap(a, 300)  # tighter cap per answer
+        chunk = f"{i}. Q: {q}\n   A: {a}\n"
+        if used + len(chunk) > MAX_HISTORY_CHARS:
+            break
+        lines.append(chunk)
+        used += len(chunk)
+    return "".join(lines) if lines else "None."
 
 
-# ---------------- Sidebar (UNCHANGED CONFIG PANEL) ----------------
+# ---------------- Sidebar (CONFIG PANEL) ----------------
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -494,7 +697,7 @@ with st.sidebar:
     user = st.text_input("User", value="neondb_owner")
     password='npg_QcHFVEf4o9uA'
     host = "ep-raspy-pond-a8p1p9je-pooler.eastus2.azure.neon.tech"
-    database = st.text_input("Database", value="neondb")
+    database = st.text_input("Database", value="test")
     sslmode = "require"
     db_uri = f"postgresql+psycopg2://{user}:{quote_plus(password)}@{host}/{database}?sslmode=require"
     # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
@@ -510,7 +713,8 @@ with st.sidebar:
     candidate_tables = [t.strip() for t in include_tables_raw.splitlines() if t.strip()]
 
     st.divider()
-    model = st.selectbox("OpenAI Chat model", ["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o"], index=0)
+    # Default to larger-context models first
+    model = st.selectbox("OpenAI Chat model", ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"], index=0)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
     top_k = st.number_input("top_k (row cap per SELECT)", min_value=1, max_value=100000, value=1000, step=100)
 
@@ -518,6 +722,9 @@ with st.sidebar:
     st.subheader("🔎 Dynamic table selection")
     k_tables = st.slider("Max tables to include", 1, 2, 2, 1)
     rebuild_schema_index = st.button("Rebuild schema index")
+
+    # NEW: toggle to include/exclude rich table info
+    include_rich_table_info = st.checkbox("Include detailed table info in LLM context", value=True)
 
     st.divider()
     st.subheader("🧩 Few-shot examples")
@@ -592,7 +799,8 @@ if prompt:
 
             # 1) Init DB & LLM
             check_connection(db_uri)
-            db = SQLDatabase.from_uri(db_uri, schema=schema or None)
+            # IMPORTANT: disable sample rows to keep LangChain's schema lean
+            db = SQLDatabase.from_uri(db_uri, schema=schema or None, sample_rows_in_table_info=0)
             llm = ChatOpenAI(model=model, temperature=temperature)
 
             # 2) Candidate tables
@@ -646,7 +854,15 @@ if prompt:
 
             dialect = "PostgreSQL"
             table_notes = build_table_notes(selected_tables, desc_map)
-            table_info = db.get_table_info(table_names=selected_tables)
+            table_notes = _cap(table_notes, MAX_TABLE_NOTES_CHARS)
+
+            # Build detailed-but-compact table_info
+            if include_rich_table_info:
+                table_info = build_rich_table_info(db_uri, schema, selected_tables)
+            else:
+                # small fallback using LangChain (already no sample rows)
+                table_info = _cap(db.get_table_info(table_names=selected_tables), MAX_TABLEINFO_CHARS)
+
             manual_inputs = {
                 "question": standalone_question,
                 "table_info": table_info,
@@ -675,13 +891,25 @@ if prompt:
             # NEW: try to fetch a tabular result for visuals (best-effort)
             df = try_fetch_dataframe(sql_to_run, db_uri)
 
-            # 8) NL rephrase
+            # 8) NL rephrase (with token-safety and graceful retry)
+            safe_result_str = _cap(result_str, MAX_RESULT_CHARS)
             rephrase_answer = build_rephraser(llm)
-            nl_answer = rephrase_answer.invoke({
-                "question": standalone_question,
-                "query": sql_to_run,
-                "result": result_str
-            })
+            try:
+                nl_answer = rephrase_answer.invoke({
+                    "question": standalone_question,
+                    "query": sql_to_run,
+                    "result": safe_result_str
+                })
+            except Exception as e:
+                if "context length" in str(e).lower() or "context_length_exceeded" in str(e).lower():
+                    # Retry with minimal context
+                    nl_answer = (answer_prompt | ChatOpenAI(model=model, temperature=temperature) | StrOutputParser()).invoke({
+                        "question": _cap(standalone_question, 400),
+                        "query": _cap(sql_to_run, 1200),
+                        "result": _cap(result_str, 3000),
+                    })
+                else:
+                    raise
 
             # 9) Render assistant bubble with answer + details
             with st.chat_message("assistant"):

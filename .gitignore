@@ -7,3 +7,10 @@ chroma_schema
 test.py
 workflow.svg.env
 .env
+data
+anonymization_summary.json
+anonymization_summary.json
+tools
+salt.txt
+
+
