@@ -832,7 +832,8 @@ SQL_EXAMPLES = [
         FROM dbo.hcp360_prsnl_engmnt e
         WHERE e."EMAIL_CLICKED"='Y' AND COALESCE(e."VALID_CONSENT_EXIST",'N') <> 'Y'
         LIMIT {top_k}
-        """
+        """,
+        "dialects": ["postgresql"]
     },
     # {
     #     "input": "Top {top_k} products by NBRX_BOTTLE_MARKETSHARE in 'Cardiology'.",
@@ -896,7 +897,8 @@ SQL_EXAMPLES = [
         GROUP BY "INDICATION"
         ORDER BY cnt DESC
         LIMIT {top_k}
-        """
+        """,
+        "dialects": ["postgresql"]
     },
     # {
     #     "input": "Products with rising email opens but falling TRX (early warning).",
@@ -1005,4 +1007,345 @@ SQL_EXAMPLES = [
     #     LIMIT {top_k}
     #     """
     # }
+    ,
+    {
+        "input": "Show monthly call counts.",
+        "query": """
+        SELECT strftime('%Y-%m', e.transaction_datetime) AS month,
+               COUNT(*) AS call_count
+        FROM hcp360_prsnl_engmnt e
+        GROUP BY month
+        ORDER BY month
+        LIMIT {top_k}
+        """,
+        "dialects": ["sqlite"]
+    },
+    {
+        "input": "Which physicians had more than 5 calls in August 2025, and what are their specialties and territories?",
+        "query": """
+        WITH calls AS (
+          SELECT e.pres_eid, e.territory_name, COUNT(*) AS call_count
+          FROM dbo.hcp360_prsnl_engmnt e
+          WHERE e.status_vod__c = 'Submitted_vod'
+            AND e.bus_mth_strt_dt = DATE '2025-08-01'
+          GROUP BY e.pres_eid, e.territory_name
+        )
+        SELECT
+          c.pres_eid,
+          p.first_name,
+          p.last_name,
+          p.primary_specialty,
+          c.territory_name,
+          c.call_count
+        FROM calls c
+        JOIN dbo.hcp360_persona p ON p.pres_eid = c.pres_eid
+        WHERE c.call_count > 5
+        ORDER BY c.call_count DESC;
+        """,
+        "dialects": ["postgresql"]
+    },
+    {
+        "input": "Which physicians had more than 5 calls in August 2025, and what are their specialties and territories?",
+        "query": """
+        SELECT
+          e.pres_eid,
+          p.first_name,
+          p.last_name,
+          p.primary_specialty,
+          COALESCE(e.territory_name, e.territory_id) AS territory,
+          COUNT(*) AS call_count
+        FROM hcp360_prsnl_engmnt e
+        JOIN hcp360_persona p ON p.pres_eid = e.pres_eid
+        WHERE e.transaction_datetime >= '2025-08-01'
+          AND e.transaction_datetime <  '2025-09-01'
+        GROUP BY e.pres_eid, p.first_name, p.last_name, p.primary_specialty, territory
+        HAVING COUNT(*) > 5
+        ORDER BY call_count DESC
+        LIMIT {top_k}
+        """,
+        "dialects": ["sqlite"]
+    },
+    {
+        "input": "Which prescribers received TRODELVY engagements for both mUC and mTNBC indications in the same week?",
+        "query": """
+        SELECT
+          e.pres_eid,
+          p.first_name,
+          p.last_name,
+          e.bus_wk_end_dt,
+          COUNT(*) AS engagements_in_week
+        FROM dbo.hcp360_prsnl_engmnt e
+        JOIN dbo.hcp360_persona p ON p.pres_eid = e.pres_eid
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.product_name = 'TRODELVY'
+        GROUP BY e.pres_eid, p.first_name, p.last_name, e.bus_wk_end_dt
+        HAVING
+          SUM(CASE WHEN e.indication = 'mUC' THEN 1 ELSE 0 END) > 0
+          AND SUM(CASE WHEN e.indication = 'mTNBC' THEN 1 ELSE 0 END) > 0
+        ORDER BY e.bus_wk_end_dt, e.pres_eid;
+        """,
+        "dialects": ["postgresql"]
+    },
+    {
+        "input": "Which prescribers received TRODELVY engagements for both mUC and mTNBC indications in the same week?",
+        "query": """
+        SELECT
+          e.pres_eid,
+          p.first_name,
+          p.last_name,
+          strftime('%Y-%W', e.transaction_datetime) AS week_bucket,
+          COUNT(*) AS engagements_in_week
+        FROM hcp360_prsnl_engmnt e
+        JOIN hcp360_persona p ON p.pres_eid = e.pres_eid
+        WHERE e.product_name = 'TRODELVY'
+          AND e.indication IN ('mUC', 'mTNBC')
+        GROUP BY e.pres_eid, p.first_name, p.last_name, week_bucket
+        HAVING COUNT(DISTINCT e.indication) = 2
+        ORDER BY week_bucket, e.pres_eid
+        LIMIT {top_k}
+        """,
+        "dialects": ["sqlite"]
+    },
+    {
+        "input": "For each territory, what percentage of total engagements were done via Telephone vs. In-Person?",
+        "query": """
+        SELECT
+          e.territory_name,
+          COUNT(*) AS total_engagements,
+          SUM(CASE WHEN e.call_type = 'Telephone' THEN 1 ELSE 0 END) AS telephone_calls,
+          SUM(CASE WHEN e.call_type = 'In-Person' THEN 1 ELSE 0 END) AS inperson_calls,
+          ROUND(100.0 * SUM(CASE WHEN e.call_type = 'Telephone' THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_telephone,
+          ROUND(100.0 * SUM(CASE WHEN e.call_type = 'In-Person' THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_inperson
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.bus_mth_strt_dt = DATE '2025-08-01'
+        GROUP BY e.territory_name
+        ORDER BY total_engagements DESC;
+        """,
+        "dialects": ["postgresql"]
+    },
+    {
+        "input": "List all sample distributions where consent was missing (valid_consent_exist = 'N') and sample_count > 0.",
+        "query": """
+        SELECT
+          e.pres_eid,
+          e.rep_id,
+          e.rep_name,
+          e.territory_name,
+          e.sample_name,
+          e.sample_count,
+          e.valid_consent_exist,
+          e.transaction_id
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND COALESCE(e.valid_consent_exist, 'N') = 'N'
+          AND COALESCE(e.sample_count, 0) > 0
+        ORDER BY e.sample_count DESC;
+        """
+    },
+    {
+        "input": "Who are the top 5 reps by number of submitted calls in August 2025?",
+        "query": """
+        WITH rep_calls AS (
+          SELECT e.rep_id, e.rep_name, COUNT(*) AS call_count
+          FROM dbo.hcp360_prsnl_engmnt e
+          WHERE e.status_vod__c = 'Submitted_vod'
+            AND e.bus_mth_strt_dt = DATE '2025-08-01'
+          GROUP BY e.rep_id, e.rep_name
+        ),
+        ranked AS (
+          SELECT
+            rep_id, rep_name, call_count,
+            RANK() OVER (ORDER BY call_count DESC) AS rnk
+          FROM rep_calls
+        )
+        SELECT rep_id, rep_name, call_count
+        FROM ranked
+        WHERE rnk <= 5
+        ORDER BY call_count DESC;
+        """
+    },
+    {
+        "input": "Do physicians with more than 20 years of experience have higher engagement counts than those with less experience?",
+        "query": """
+        WITH call_counts AS (
+          SELECT e.pres_eid, COUNT(*) AS calls_aug
+          FROM dbo.hcp360_prsnl_engmnt e
+          WHERE e.status_vod__c = 'Submitted_vod'
+            AND e.bus_mth_strt_dt = DATE '2025-08-01'
+          GROUP BY e.pres_eid
+        ),
+        labeled AS (
+          SELECT
+            p.pres_eid,
+            CASE WHEN COALESCE(p.years_of_experience, 0) > 20 THEN 'Senior' ELSE 'Junior' END AS exp_band,
+            COALESCE(c.calls_aug, 0) AS calls_aug
+          FROM dbo.hcp360_persona p
+          LEFT JOIN call_counts c ON c.pres_eid = p.pres_eid
+        )
+        SELECT
+          exp_band,
+          COUNT(*) AS physicians,
+          AVG(calls_aug) AS avg_calls_aug
+        FROM labeled
+        GROUP BY exp_band;
+        """
+    },
+    {
+        "input": "Which active prescribers (pres_status = 'ACTIVE') did not receive any engagement in August 2025?",
+        "query": """
+        WITH aug_calls AS (
+          SELECT DISTINCT e.pres_eid
+          FROM dbo.hcp360_prsnl_engmnt e
+          WHERE e.status_vod__c = 'Submitted_vod'
+            AND e.bus_mth_strt_dt = DATE '2025-08-01'
+        )
+        SELECT
+          p.pres_eid,
+          p.first_name,
+          p.last_name,
+          p.primary_specialty,
+          p.pres_status
+        FROM dbo.hcp360_persona p
+        LEFT JOIN aug_calls a ON a.pres_eid = p.pres_eid
+        WHERE p.pres_status = 'ACTIVE'
+          AND a.pres_eid IS NULL
+        ORDER BY p.last_name, p.first_name;
+        """
+    },
+    {
+        "input": "For each rep, what is the ratio of total samples distributed to total calls made?",
+        "query": """
+        SELECT
+          e.rep_id,
+          e.rep_name,
+          COUNT(*) AS total_calls,
+          SUM(COALESCE(e.sample_count, 0)) AS total_samples,
+          ROUND(1.0 * SUM(COALESCE(e.sample_count, 0)) / NULLIF(COUNT(*), 0), 3) AS samples_per_call
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.bus_mth_strt_dt = DATE '2025-08-01'
+        GROUP BY e.rep_id, e.rep_name
+        ORDER BY samples_per_call DESC, total_calls DESC;
+        """
+    },
+    {
+        "input": "Find duplicate transactions where the same prescriber, rep, and datetime appear multiple times.",
+        "query": """
+        SELECT
+          e.pres_eid,
+          e.rep_id,
+          e.transaction_datetime,
+          COUNT(*) AS dup_count,
+          STRING_AGG(e.transaction_id, ',') AS transaction_ids
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+        GROUP BY e.pres_eid, e.rep_id, e.transaction_datetime
+        HAVING COUNT(*) > 1
+        ORDER BY dup_count DESC;
+        """
+    },
+    {
+        "input": "Show weekly trends of call volume per territory for August 2025.",
+        "query": """
+        SELECT
+          e.bus_wk_end_dt,
+          e.territory_name,
+          COUNT(*) AS call_count
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.bus_mth_strt_dt = DATE '2025-08-01'
+        GROUP BY e.bus_wk_end_dt, e.territory_name
+        ORDER BY e.bus_wk_end_dt, call_count DESC;
+        """,
+        "dialects": ["postgresql"]
+    },
+    {
+        "input": "For all email campaigns, what percentage of sent emails were opened and clicked?",
+        "query": """
+        SELECT
+          COUNT(CASE WHEN e.email_sent    = 'Y' THEN 1 END) AS sent,
+          COUNT(CASE WHEN e.email_opened  = 'Y' THEN 1 END) AS opened,
+          COUNT(CASE WHEN e.email_clicked = 'Y' THEN 1 END) AS clicked,
+          ROUND(100.0 * COUNT(CASE WHEN e.email_opened = 'Y' THEN 1 END) /
+                       NULLIF(COUNT(CASE WHEN e.email_sent = 'Y' THEN 1 END), 0), 2) AS open_rate_pct,
+          ROUND(100.0 * COUNT(CASE WHEN e.email_clicked = 'Y' THEN 1 END) /
+                       NULLIF(COUNT(CASE WHEN e.email_opened = 'Y' THEN 1 END), 0), 2) AS click_rate_pct_from_opens
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.bus_mth_strt_dt = DATE '2025-08-01';
+        """,
+        "dialects": ["postgresql"]
+    },
+    {
+        "input": "Which KOLs (kol_flag = 'Y') received the most engagements in August 2025?",
+        "query": """
+        SELECT
+          e.pres_eid,
+          p.first_name,
+          p.last_name,
+          COUNT(*) AS call_count
+        FROM dbo.hcp360_prsnl_engmnt e
+        JOIN dbo.hcp360_persona p ON p.pres_eid = e.pres_eid
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND e.bus_mth_strt_dt = DATE '2025-08-01'
+          AND COALESCE(p.kol_flag, 'N') = 'Y'
+        GROUP BY e.pres_eid, p.first_name, p.last_name
+        ORDER BY call_count DESC;
+        """
+    },
+    {
+        "input": "Classify prescribers into High (≥10 calls), Medium (5-9 calls), and Low (<5 calls) engagement segments for August 2025.",
+        "query": """
+        WITH counts AS (
+          SELECT e.pres_eid, COUNT(*) AS call_count
+          FROM dbo.hcp360_prsnl_engmnt e
+          WHERE e.status_vod__c = 'Submitted_vod'
+            AND e.bus_mth_strt_dt = DATE '2025-08-01'
+          GROUP BY e.pres_eid
+        )
+        SELECT
+          c.pres_eid,
+          p.first_name,
+          p.last_name,
+          p.primary_specialty,
+          c.call_count,
+          CASE
+            WHEN c.call_count >= 10 THEN 'High'
+            WHEN c.call_count BETWEEN 5 AND 9 THEN 'Medium'
+            ELSE 'Low'
+          END AS engagement_segment
+        FROM counts c
+        JOIN dbo.hcp360_persona p ON p.pres_eid = c.pres_eid
+        ORDER BY engagement_segment DESC, c.call_count DESC;
+        """
+    },
+    {
+        "input": "Find all calls where parent_call is NULL but clm_flag = TRUE.",
+        "query": """
+        SELECT
+          e.transaction_id,
+          e.pres_eid,
+          e.rep_id,
+          e.rep_name,
+          e.territory_name,
+          e.clm_flag,
+          e.parent_call,
+          e.transaction_datetime
+        FROM dbo.hcp360_prsnl_engmnt e
+        WHERE e.status_vod__c = 'Submitted_vod'
+          AND (e.parent_call IS NULL OR e.parent_call = '')
+          AND e.clm_flag = TRUE
+        ORDER BY e.transaction_datetime DESC;
+        """
+    },
+    {
+        "input": "How many prescribers are flagged in both the ONC and HIV universes?",
+        "query": """
+        SELECT COUNT(DISTINCT p.pres_eid) AS prescribers_in_both_universes
+        FROM dbo.hcp360_persona p
+        WHERE COALESCE(p.onc_universe_flag, 'N') = 'Y'
+          AND COALESCE(p.hiv_universe_flag, 'N') = 'Y';
+        """
+    }
 ]

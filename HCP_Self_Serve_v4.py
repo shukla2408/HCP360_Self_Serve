@@ -55,6 +55,7 @@ from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
 from sqlalchemy import create_engine, text, inspect
 import altair as alt
 from sqlalchemy.exc import OperationalError
+from typing import Iterable, Tuple
 
 # ---- Backwards-compatible examples import ----
 try:
@@ -101,6 +102,57 @@ def _cap(s: str, n: int) -> str:
     s = s or ""
     return (s[:n] + " …") if len(s) > n else s
 
+
+def _sanitize_table_name(name: str) -> str:
+    name = os.path.splitext(os.path.basename(name or "table"))[0]
+    name = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = "table"
+    if name[0].isdigit():
+        name = "t_" + name
+    return name.lower()
+
+
+def ingest_csvs_to_sqlite(files: Iterable, db_uri: str, if_exists: str = "replace") -> list[Tuple[str, int]]:
+    """Load uploaded CSV files into SQLite tables. Returns list of (table_name, row_count)."""
+    created: list[Tuple[str, int]] = []
+    engine = create_engine(db_uri)
+    for f in files:
+        try:
+            table = _sanitize_table_name(getattr(f, "name", "table"))
+            df = pd.read_csv(f)
+            df.to_sql(table, engine, if_exists=if_exists, index=False)
+            created.append((table, len(df)))
+        except Exception:
+            continue
+    return created
+
+
+def create_demo_sqlite_schema(db_uri: str) -> list[str]:
+    """Create small demo tables in SQLite for local testing. Returns list of table names created."""
+    engine = create_engine(db_uri)
+    tables: list[str] = []
+    try:
+        persona = pd.DataFrame([
+            {"pres_eid": 101, "hcp_name": "Alice Martin", "specialty": "Cardiology", "state": "NY"},
+            {"pres_eid": 102, "hcp_name": "Brian Chen", "specialty": "Oncology", "state": "CA"},
+            {"pres_eid": 103, "hcp_name": "Carmen Diaz", "specialty": "Dermatology", "state": "TX"},
+        ])
+        persona.to_sql("hcp360_persona", engine, if_exists="replace", index=False)
+        tables.append("hcp360_persona")
+
+        eng = pd.DataFrame([
+            {"pres_eid": 101, "channel": "email", "date": "2024-06-01", "impressions": 120, "clicks": 8},
+            {"pres_eid": 101, "channel": "web",   "date": "2024-06-10", "impressions": 300, "clicks": 20},
+            {"pres_eid": 102, "channel": "email", "date": "2024-06-03", "impressions": 200, "clicks": 14},
+            {"pres_eid": 103, "channel": "web",   "date": "2024-06-02", "impressions": 150, "clicks": 5},
+        ])
+        eng.to_sql("hcp360_prsnl_engmnt", engine, if_exists="replace", index=False)
+        tables.append("hcp360_prsnl_engmnt")
+    except Exception:
+        pass
+    return tables
 
 def clean_sql(s: str | None) -> str:
     """Extract a runnable single SQL statement from LLM output (strip code fences, comments, trailing semicolons)."""
@@ -290,6 +342,95 @@ def render_visuals(df: pd.DataFrame) -> None:
     # If no suitable chart, quietly skip
 
 
+# ----------- Auto-summary (deterministic, DF-driven) -----------#
+def _pick_columns_for_summary(df: pd.DataFrame) -> Tuple[str | None, str | None]:
+    """Return (category_col, value_col) heuristically.
+    Prefers common names; falls back to first object + first numeric.
+    """
+    if df is None or df.empty:
+        return (None, None)
+    # Identify numeric columns
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    # Identify candidates for category
+    cat_cols = [c for c in df.columns if c not in numeric_cols]
+
+    # Prefer well-known value columns
+    value_prefs = [
+        "call_count", "count", "hcp_count", "hcps", "engagements", "total", "cnt",
+    ]
+    value_col = None
+    for v in value_prefs:
+        for c in df.columns:
+            if c.lower() == v:
+                value_col = c
+                break
+        if value_col:
+            break
+    if not value_col and numeric_cols:
+        value_col = numeric_cols[0]
+
+    # Prefer well-known category columns
+    cat_prefs = [
+        "city", "month", "territory", "territory_name", "state", "category", "name",
+    ]
+    cat_col = None
+    for v in cat_prefs:
+        for c in df.columns:
+            if c.lower() == v:
+                cat_col = c
+                break
+        if cat_col:
+            break
+    if not cat_col and cat_cols:
+        cat_col = cat_cols[0]
+
+    return (cat_col, value_col)
+
+
+def _auto_short_summary(df: pd.DataFrame, question: str | None = None) -> str | None:
+    """Produce a concise, consistent summary directly from the DataFrame when suitable.
+    Handles simple aggregations like counts by month/city/state. Returns None if not applicable.
+    """
+    if df is None or df.empty:
+        return None
+    cat_col, val_col = _pick_columns_for_summary(df)
+    if not cat_col or not val_col:
+        return None
+    try:
+        # Coerce value column to numeric for safe sorting
+        vals = pd.to_numeric(df[val_col], errors="coerce")
+        if vals.isna().all():
+            return None
+        # Work on a copy to avoid mutating session state
+        tmp = df[[cat_col, val_col]].copy()
+        tmp[val_col] = pd.to_numeric(tmp[val_col], errors="coerce")
+        tmp = tmp.dropna(subset=[val_col])
+        if tmp.empty:
+            return None
+        tmp = tmp.sort_values(val_col, ascending=False)
+        top = tmp.head(3).values.tolist()
+        # Build a compact line like: Top cities: X 402, Y 410, Z 429.
+        # Pick a label based on cat_col
+        label_map = {
+            "city": "cities",
+            "month": "months",
+            "state": "states",
+            "territory": "territories",
+            "territory_name": "territories",
+        }
+        label = label_map.get(cat_col.lower(), cat_col)
+        pieces = [f"{str(a)} {int(b)}" for a, b in top]
+        if not pieces:
+            return None
+        if question and re.search(r"\bmonth\b", question.lower()) and cat_col.lower() == "month":
+            prefix = "Monthly call counts"
+        else:
+            prefix = f"Top {label} by count"
+        return f"{prefix}: " + ", ".join(pieces) + "."
+    except Exception:
+        return None
+
+
 # ----------- Schema Introspection + Self-heal helpers -----------#
 def build_columns_index(db_uri: str, schema: str | None, tables: List[str]) -> dict[str, set[str]]:
     """Return {table: set(column names in various cases)} for quick existence checks."""
@@ -344,6 +485,23 @@ def suggest_join_keys(index: dict[str, set[str]], tables: List[str]) -> List[str
     return ordered
 
 
+def find_columns_containing(index: dict[str, set[str]], words: List[str]) -> dict[str, List[str]]:
+    """Return {table: [columns]} where any column name contains any of the words (case-insensitive)."""
+    needles = {w.lower() for w in words if isinstance(w, str) and len(w) >= 3}
+    out: dict[str, List[str]] = {}
+    if not needles:
+        return out
+    for t, cols in index.items():
+        hits: List[str] = []
+        for c in cols:
+            lc = c.lower()
+            if any(n in lc for n in needles):
+                hits.append(c)
+        if hits:
+            out[t] = sorted(list(set(hits)))
+    return out
+
+
 # ---------------- Few-shot Examples (FAISS) ----------------
 def get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings()
@@ -374,12 +532,40 @@ def _extract_tables_from_sql(sql: str) -> set[str]:
     return tables
 
 
-def build_example_selector(top_k_limit: int, k: int = 3, allowed_tables: List[str] | None = None) -> SemanticSimilarityExampleSelector:
+def build_example_selector(top_k_limit: int, k: int = 3, allowed_tables: List[str] | None = None, dialect: str | None = None) -> SemanticSimilarityExampleSelector:
     allowed = {t.lower() for t in (allowed_tables or [])}
     formatted = []
+    # Normalize dialect
+    d = (dialect or "").lower()
+    d = "postgresql" if "postgres" in d else ("sqlite" if "sqlite" in d else d)
+    # Tokens that are Postgres-specific and often incompatible with SQLite
+    pg_only_tokens = [
+        r"NULLS\s+LAST",
+        r"DATE_TRUNC\(",
+        r"\bINTERVAL\b",
+        r"STRING_AGG\(",
+        r"::",  # cast
+        r"DATE\s+'",  # DATE '2025-08-01'
+        r"\bILIKE\b",
+        r"GROUPING\s+SETS",
+    ]
     for ex in SQL_EXAMPLES:
         q = ex.get("question") or ex.get("input", "")
         s = (ex.get("sql") or ex.get("query", "")).replace("{top_k}", str(top_k_limit))
+        # Dialect gating via example metadata
+        ex_dialects = ex.get("dialects")
+        if ex_dialects and d:
+            if d not in [str(x).lower() for x in ex_dialects]:
+                continue
+        # Heuristic: filter out PG-only syntax when running on SQLite
+        if d == "sqlite":
+            for tok in pg_only_tokens:
+                import re as _re
+                if _re.search(tok, s, flags=_re.IGNORECASE):
+                    s = None
+                    break
+            if s is None:
+                continue
         if not (q and s):
             continue
         # Filter out examples that reference tables not present in the DB
@@ -425,7 +611,7 @@ example_prompt = PromptTemplate(
     input_variables=["question", "sql"],
     template=(
         "User question:\n{question}\n\n"
-        "Target SQL (PostgreSQL):\n{sql}\n"
+        "Target SQL:\n{sql}\n"
         "----\n"
     ),
 )
@@ -448,11 +634,18 @@ def build_sql_prompt_with_examples(selector: SemanticSimilarityExampleSelector) 
         "9) For aggregations, include proper GROUP BY clauses for all non-aggregated selected columns.\n"
         "10) If a filter is requested with free text (e.g., name matching), use safe, schema-backed columns only; avoid brittle string concatenations unless present in table_info.\n"
         "11) When the question narrows a 'universe' or filter using one table (e.g., engagements), but requires attributes stored in another table (e.g., demographics), JOIN the relevant tables using keys in table_info (e.g., pres_eid) instead of assuming the attribute exists in the filtered table.\n"
+        "12) Preserve exact table names from table_info (e.g., do not shorten 'hcp360_persona' to 'persona').\n"
+        "13) If the question asks 'Which HCPs/physicians/doctors...', return one row per HCP (use the unique key such as pres_eid). Include the requested attributes via JOINs, but keep the aggregation grain at the HCP level.\n"
+        "14) For month filters, prefer a standard inclusive-exclusive range using an actual date/datetime column from table_info (e.g., >= 2025-08-01 and < 2025-09-01). Do not invent vendor-specific date fields.\n"
+        "15) If the concept 'calls' exists, filter using only clearly indicated columns in table_info (e.g., interaction_type/channel flags that denote calls). If no such column exists, count the relevant engagement rows without inventing columns.\n"
+        "16) If the user requests only a time-bucketed count (e.g., 'month wise call count'), aggregate solely by that time bucket; DO NOT include extra dimensions (e.g., territory) unless explicitly requested. Order by the time bucket ascending.\n"
+        "17) Do NOT use aggregate functions in the WHERE clause (e.g., MAX/SUM/COUNT); instead, use HAVING after GROUP BY or compute the aggregate in a subquery/CTE and join/filter on it.\n"
         "\n"
         "PROCESS TO FOLLOW WHEN CREATING THE QUERY:\n"
         "A) Identify the minimal set of ALLOWED TABLES needed to answer the question.\n"
         "B) From table_info, copy exact column names; do not guess or rename.\n"
         "C) Define JOINs using keys/relationships evident in table_info (e.g., p.pres_eid = s.pres_eid). Do not add text-based identity matches when a key exists.\n"
+        "C1) Respect the requested grain (e.g., HCP-level when the question says 'Which physicians'); aggregate with GROUP BY at that grain only.\n"
         "D) If and only if the user explicitly asks for filters, add them under WHERE (or HAVING for post-aggregation).\n"
         "E) Add GROUP BY / aggregates only if required by the question.\n"
         "F) Add ORDER BY only if the user requests sorting (e.g., top N, highest/lowest, alphabetical).\n"
@@ -543,7 +736,9 @@ def build_or_load_schema_vs(db: SQLDatabase, table_names: List[str], desc_map: D
     for t in table_names:
         try:
             base_info = db.get_table_info(table_names=[t])
-            human_desc = get_desc_for("dbo."+t, desc_map)
+            # Prefer schema-qualified description if present, else bare table name
+            key = f"{schema}.{t}" if schema else t
+            human_desc = get_desc_for(key, desc_map) or get_desc_for(t, desc_map)
             doc_text = f"Table: {t}\nDescription: {human_desc}\n\n{base_info}"
             texts.append(doc_text)
             metas.append({"table": t})
@@ -595,7 +790,9 @@ def select_relevant_tables(schema_vs, question: str, k_tables: int) -> List[str]
 def build_table_notes(selected_tables: List[str], desc_map: Dict[str, str]) -> str:
     lines = []
     for t in selected_tables:
-        desc = get_desc_for("dbo."+t, desc_map)
+        # Prefer schema-qualified description if present, else bare table name
+        key = f"{schema}.{t}" if ("schema" in globals() and schema) else t
+        desc = get_desc_for(key, desc_map) or get_desc_for(t, desc_map)
         if desc:
             lines.append(f"- {t}: {desc}")
         else:
@@ -755,28 +952,93 @@ def _format_table_summary(conn, engine, schema: str, table: str) -> str:
     return _cap(summary, MAX_PER_TABLE_CHARS)
 
 
+def _format_table_summary_generic(conn, engine, table: str) -> str:
+    insp = inspect(engine)
+    cols = insp.get_columns(table)
+
+    # Primary keys and foreign keys (best-effort for generic dialects)
+    try:
+        pk_info = insp.get_pk_constraint(table) or {}
+        pks = pk_info.get("constrained_columns") or []
+    except Exception:
+        pks = []
+    try:
+        fk_info = insp.get_foreign_keys(table) or []
+        fks = []
+        for fk in fk_info:
+            lc = ", ".join(fk.get("constrained_columns") or [])
+            rt = fk.get("referred_table") or "?"
+            rc = ", ".join(fk.get("referred_columns") or [])
+            if lc and rt:
+                fks.append((lc, rt, rc))
+    except Exception:
+        fks = []
+
+    # Sample a few rows
+    sample_df = None
+    if INCLUDE_SAMPLE_VALUES and SAMPLE_ROWS_FOR_PROFILE > 0:
+        try:
+            sql = text(f'SELECT * FROM "{table}" LIMIT {SAMPLE_ROWS_FOR_PROFILE}')
+            sample_df = pd.read_sql_query(sql, conn)
+        except Exception:
+            sample_df = None
+
+    lines = [f"Table: {table}"]
+    lines.append("Columns:")
+    for c in cols:
+        name = c.get("name")
+        dtype = str(c.get("type"))
+        nullable = "NULL" if c.get("nullable") else "NOT NULL"
+        col_line = f"  - {name}: {dtype}, {nullable}"
+        if sample_df is not None and name in sample_df.columns:
+            try:
+                vals = (
+                    sample_df[name]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )[:SAMPLE_VALUES_PER_COLUMN]
+                if vals:
+                    col_line += f" (eg: {', '.join(vals)})"
+            except Exception:
+                pass
+        lines.append(col_line)
+
+    if pks:
+        lines.append("Primary key: " + ", ".join(pks))
+    if fks:
+        rels = [f"{lc} → {rt}.{rc}" for lc, rt, rc in fks]
+        lines.append("Foreign keys: " + "; ".join(rels))
+
+    summary = "\n".join(lines)
+    return _cap(summary, MAX_PER_TABLE_CHARS)
+
+
 def build_rich_table_info(db_uri: str, schema: str | None, tables: list[str]) -> str:
-    schema = schema or "public"
     try:
         engine = create_engine(db_uri)
+        dialect_name = engine.dialect.name.lower()
         with engine.connect() as conn:
             parts = []
             for t in tables:
                 try:
-                    parts.append(_format_table_summary(conn, engine, schema, t))
+                    if dialect_name == "postgresql":
+                        use_schema = (schema or "public")
+                        parts.append(_format_table_summary(conn, engine, use_schema, t))
+                    else:
+                        parts.append(_format_table_summary_generic(conn, engine, t))
                 except Exception:
-                    # fall back to basic info from LangChain if one table fails
                     try:
-                        db = SQLDatabase.from_uri(db_uri, schema=schema, sample_rows_in_table_info=0)
+                        db = SQLDatabase.from_uri(db_uri, schema=(schema or None), sample_rows_in_table_info=0)
                         parts.append(db.get_table_info(table_names=[t]))
                     except Exception:
                         parts.append(f"Table: {t}\n(no metadata available)")
             blob = "\n\n".join(parts)
             return _cap(blob, MAX_TABLEINFO_CHARS)
     except Exception:
-        # absolute fallback: LangChain’s default (already trimmed elsewhere)
         try:
-            db = SQLDatabase.from_uri(db_uri, schema=schema, sample_rows_in_table_info=0)
+            db = SQLDatabase.from_uri(db_uri, schema=(schema or None), sample_rows_in_table_info=0)
             return _cap(db.get_table_info(table_names=tables), MAX_TABLEINFO_CHARS)
         except Exception:
             return ""
@@ -784,23 +1046,16 @@ def build_rich_table_info(db_uri: str, schema: str | None, tables: list[str]) ->
 
 # ---------------- NL Answer Prompt (business stakeholder) ----------------
 answer_prompt = PromptTemplate.from_template(
-    """You are given a user question, a SQL query (for context only), and the SQL result. 
-Write a clear, business-friendly answer that focuses only on the insights from the result.
+    """You are given a user question, a SQL query (for context only), and the SQL result.
+Write a concise, business-friendly insight that focuses only on what the result shows.
 
-Rules:
-- Do not mention SQL, queries, tables, or databases. 
-- Always frame the output as business insights for a stakeholder. 
-- If the result is numeric/aggregate (counts, sums, averages, etc.), summarize the key finding in plain language. 
-- If the result is row-level data (lists of people, products, transactions, etc.), summarize the overall insight first (e.g., number of rows), then list the details. 
-- When listing rows:
-    * Use the SELECT clause to infer column headers and their order. 
-    * Present each row as a clean, human-readable record with labels. 
-    * Skip null/None values — do not show them. 
-- Keep formatting professional: start with a high-level summary, then show supporting details in bullet points or blocks. 
-- Use business terminology from the question when possible. 
-- 🚨 If the SQL Result is empty:
-    * Do NOT invent, imagine, or infer any records. 
-    * Simply respond with: "No relevant records were found for this request."
+Strict constraints:
+- Length: 2–3 short sentences, max ~280 characters total.
+- No fluff, no restating the question, no headings or bullet lists.
+- Do not mention SQL, queries, tables, or databases.
+- If the result is numeric/aggregate, state the key number(s) and a plain-language interpretation.
+- If the result is row-level data, give one short overall takeaway; optionally include a single concrete example — still within the length limit.
+- If the SQL result is empty, do not infer or imagine any findings (the app will handle empty results elsewhere).
 
 Question: {question}
 (Context only — do not mention this): {query}
@@ -811,6 +1066,24 @@ Answer:"""
 
 def build_rephraser(llm: ChatOpenAI):
     return answer_prompt | llm | StrOutputParser()
+
+
+# Enforce concise output in case the model gets verbose
+def _enforce_concise(text: str, max_sentences: int = 3, max_chars: int = 280) -> str:
+    if not text:
+        return text
+    s = str(text).strip()
+    # Keep explicit empty-result message intact
+    if s.lower().startswith("no relevant records were found"):
+        return s
+    # Normalize whitespace
+    s = re.sub(r"\s+", " ", s)
+    # Split into sentences
+    parts = re.split(r"(?<=[.!?])\s+", s)
+    s2 = " ".join(parts[:max_sentences]).strip()
+    if len(s2) > max_chars:
+        s2 = s2[: max(0, max_chars - 1)].rstrip() + "…"
+    return s2
 
 
 # ---------------- Follow-up Question Rewriter ----------------
@@ -860,15 +1133,59 @@ def history_to_bullets(turns):
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    st.caption("Connection (Neon)")
-    user = st.text_input("User", value="neondb_owner")
-    password='npg_QcHFVEf4o9uA'
-    host = "ep-raspy-pond-a8p1p9je-pooler.eastus2.azure.neon.tech"
-    database = st.text_input("Database", value="test")
-    sslmode = "require"
-    db_uri = f"postgresql+psycopg2://{user}:{quote_plus(password)}@{host}/{database}?sslmode=require"
-    # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
-    schema = st.text_input("Schema (optional)", value="dbo")
+    st.subheader("Database Source")
+    use_server_db = st.toggle("Use server database (Postgres)", value=True)
+
+    if use_server_db:
+        st.caption("Connection (Neon)")
+        user = st.text_input("User", value="neondb_owner")
+        password='npg_QcHFVEf4o9uA'
+        host = "ep-raspy-pond-a8p1p9je-pooler.eastus2.azure.neon.tech"
+        database = st.text_input("Database", value="test")
+        sslmode = "require"
+        db_uri = f"postgresql+psycopg2://{user}:{quote_plus(password)}@{host}/{database}?sslmode=require"
+        schema = st.text_input("Schema (optional)", value="dbo")
+        dialect = "PostgreSQL"
+        # st.code(db_uri.replace(quote_plus(password), "*****"), language="bash")
+    else:
+        st.caption("Local SQLite")
+        sqlite_path = st.text_input("SQLite file path", value="local.db", help="Path to a .db or .sqlite file on this server.")
+        db_uri = f"sqlite:///{sqlite_path}"
+        schema = None
+        dialect = "SQLite"
+
+        with st.expander("Load data into SQLite"):
+            st.caption("Upload CSV files and load them as tables into the local SQLite database.")
+            uploaded = st.file_uploader("Upload one or more CSVs", type=["csv"], accept_multiple_files=True)
+            mode = st.selectbox("Write mode", ["replace", "append"], index=0, help="Replace recreates tables. Append adds rows if table exists.")
+            if st.button("Ingest uploaded CSVs", use_container_width=True, disabled=not uploaded):
+                created = ingest_csvs_to_sqlite(uploaded or [], db_uri, if_exists=mode)
+                if created:
+                    for t, n in created:
+                        st.success(f"Loaded {n} rows into table '{t}'.")
+                else:
+                    st.warning("No tables created. Ensure valid CSVs were uploaded.")
+
+        if st.button("Create demo tables in SQLite", use_container_width=True):
+            made = create_demo_sqlite_schema(db_uri)
+            if made:
+                st.success("Created demo tables: " + ", ".join(made))
+            else:
+                st.warning("Could not create demo tables (check write permissions).")
+
+    st.subheader("Table Descriptions")
+    desc_csv_path = st.text_input("CSV path", value=CSV_PATH)
+    desc_xls_path = st.text_input("Excel path", value=EXCEL_PATH)
+    exists_msg = []
+    try:
+        exists_msg.append(f"CSV: {'found' if os.path.exists(desc_csv_path) else 'missing'}")
+    except Exception:
+        exists_msg.append("CSV: unknown")
+    try:
+        exists_msg.append(f"Excel: {'found' if os.path.exists(desc_xls_path) else 'missing'}")
+    except Exception:
+        exists_msg.append("Excel: unknown")
+    st.caption("; ".join(exists_msg))
 
     st.caption("Candidate tables (leave BLANK to auto-discover ALL tables from DB)")
     include_tables_raw = st.text_area(
@@ -976,7 +1293,7 @@ if prompt:
     else:
         try:
             # 0) Load descriptions from CSV + Excel (Excel wins on conflicts)
-            desc_map = load_table_descriptions(CSV_PATH, EXCEL_PATH)
+            desc_map = load_table_descriptions(desc_csv_path, desc_xls_path)
             if not desc_map:
                 st.warning(
                     "No table descriptions loaded from CSV/Excel. Proceeding without descriptions."
@@ -1047,10 +1364,10 @@ if prompt:
             # 6) Few-shot + SQL generation
             if rebuild_example_index and os.path.exists(EX_PERSIST_DIR):
                 shutil.rmtree(EX_PERSIST_DIR, ignore_errors=True)
-            selector = build_example_selector(top_k_limit=int(top_k), k=k_examples, allowed_tables=all_candidates)
+            selector = build_example_selector(top_k_limit=int(top_k), k=k_examples, allowed_tables=all_candidates, dialect=dialect)
             custom_prompt = build_sql_prompt_with_examples(selector)
 
-            dialect = "PostgreSQL"
+            # Dialect comes from the sidebar (Postgres vs SQLite)
             table_notes = build_table_notes(selected_tables, desc_map)
             table_notes = _cap(table_notes, MAX_TABLE_NOTES_CHARS)
 
@@ -1061,8 +1378,161 @@ if prompt:
                 # small fallback using LangChain (already no sample rows)
                 table_info = _cap(db.get_table_info(table_names=selected_tables), MAX_TABLEINFO_CHARS)
 
+            # Optional: add grain and metric hints for entity-focused questions to reduce misinterpretation
+            grain_hint = ""
+            try:
+                qlow = (standalone_question or "").lower()
+                if re.search(r"\bwhich\s+(physicians|doctors|hcps)\b", qlow):
+                    grain_hint = (
+                        "\nNote: Return one row per HCP (use the unique key such as pres_eid). "
+                        "Include physician name if columns exist, plus specialty and territory. "
+                        "Filter to the requested month using a valid date/datetime column from table_info. "
+                        "Group at the HCP level and use HAVING COUNT(*) > N when counting interactions."
+                    )
+            except Exception:
+                pass
+
+            # Additional metric/date hints when question mentions "+N calls in <Month YYYY>"
+            metric_hint = ""
+            try:
+                # Extract threshold N
+                m_calls = re.search(r"\b(more than|greater than|>\s*)(\d+)\s+calls?\b", (standalone_question or ""), flags=re.IGNORECASE)
+                n_calls = m_calls.group(2) if m_calls else None
+
+                # Extract month-year like "August 2025"
+                months = {
+                    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+                    'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+                }
+                my = re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b", (standalone_question or ""), flags=re.IGNORECASE)
+                from_to = None
+                if my:
+                    mon = months[my.group(1).lower()]
+                    yr = int(my.group(2))
+                    import datetime as _dt
+                    start = _dt.date(yr, mon, 1)
+                    if mon == 12:
+                        end = _dt.date(yr + 1, 1, 1)
+                    else:
+                        end = _dt.date(yr, mon + 1, 1)
+                    from_to = (start.isoformat(), end.isoformat())
+
+                # Column hints from schema
+                cols_index = build_columns_index(db_uri, schema or None, selected_tables)
+                date_hits = find_columns_containing(cols_index, ["date", "dt", "time", "timestamp", "datetime"])  # table -> [cols]
+
+                # Prefs for territory and names if present
+                has_terr_name = any("territory_name" in {c.lower() for c in cols} for cols in cols_index.values())
+                has_terr_id = any("territory_id" in {c.lower() for c in cols} for cols in cols_index.values())
+                has_fname = any("first_name" in {c.lower() for c in cols} for cols in cols_index.values())
+                has_lname = any("last_name" in {c.lower() for c in cols} for cols in cols_index.values())
+
+                hint_parts = []
+                if n_calls:
+                    hint_parts.append(f"Include COUNT(*) AS call_count and HAVING call_count > {n_calls}.")
+                if from_to:
+                    hint_parts.append(f"For that month, filter with an inclusive-exclusive range: >= '{from_to[0]}' and < '{from_to[1]}'.")
+                # List candidate date columns to avoid inventing vendor fields
+                try:
+                    if date_hits:
+                        top = []
+                        for t, cols in date_hits.items():
+                            if t in selected_tables:
+                                top.extend([f"{t}.{c}" for c in cols[:2]])
+                        if top:
+                            hint_parts.append("Use a real date/datetime column such as: " + ", ".join(top[:6]) + ".")
+                except Exception:
+                    pass
+                if has_terr_name and has_terr_id:
+                    hint_parts.append("Prefer territory name; if both name and id exist, use COALESCE(name, id) as territory.")
+                if has_fname and has_lname:
+                    hint_parts.append("If supported, include physician_name from first_name and last_name; otherwise keep separate.")
+
+                if hint_parts:
+                    metric_hint = "\n" + " ".join(hint_parts)
+            except Exception:
+                pass
+
+            # Time-bucket hint for questions like "month wise call count" (no extra dimensions)
+            time_hint = ""
+            try:
+                qlow2 = (standalone_question or "").lower()
+                if re.search(r"\b(month[-\s]?wise|monthly|by month|per month)\b", qlow2):
+                    parts = [
+                        "Aggregate only by month; do not include other dimensions unless explicitly requested.",
+                        "Order results by month ascending.",
+                        "Use a valid date/datetime column from table_info for the month bucket.",
+                        "For PostgreSQL use DATE_TRUNC('month', <date_col>), for SQLite use strftime('%Y-%m', <date_col>).",
+                    ]
+                    # Add concrete candidate date columns if we computed date_hits above
+                    try:
+                        if 'date_hits' in locals() and date_hits:
+                            top = []
+                            for t, cols in date_hits.items():
+                                if t in selected_tables:
+                                    top.extend([f"{t}.{c}" for c in cols[:2]])
+                            if top:
+                                parts.append("Candidate columns: " + ", ".join(top[:6]) + ".")
+                    except Exception:
+                        pass
+                    time_hint = "\nNote: " + " ".join(parts)
+            except Exception:
+                pass
+
+            # Weekly bucket hint for questions like "same week" / weekly comparisons
+            weekly_hint = ""
+            try:
+                if re.search(r"\bsame\s+week\b|\bweekly\b", (standalone_question or ""), flags=re.IGNORECASE):
+                    parts = [
+                        "Derive a week bucket from a valid date/datetime column in table_info.",
+                        "Group by pres_eid and the week bucket; use HAVING COUNT(DISTINCT <dimension>) to enforce 'both' conditions (e.g., two indications).",
+                        "For PostgreSQL use DATE_TRUNC('week', <date_col>); for SQLite use strftime('%Y-%W', <date_col>).",
+                        "Avoid aggregates in WHERE; use HAVING or subqueries for weekly filters.",
+                    ]
+                    # Add concrete candidate date columns if we computed date_hits above
+                    try:
+                        if 'date_hits' in locals() and date_hits:
+                            top = []
+                            for t, cols in date_hits.items():
+                                if t in selected_tables:
+                                    top.extend([f"{t}.{c}" for c in cols[:2]])
+                            if top:
+                                parts.append("Candidate date columns: " + ", ".join(top[:6]) + ".")
+                    except Exception:
+                        pass
+                    weekly_hint = "\nNote: " + " ".join(parts)
+            except Exception:
+                pass
+
+            # Context subset hint for phrases like "within those top 5 states"
+            subset_hint = ""
+            try:
+                m_top = re.search(r"within\s+(?:those|the)\s+top\s*(\d+)\s*states", (standalone_question or ""), flags=re.IGNORECASE)
+                if m_top:
+                    n_states = m_top.group(1)
+                    cols_index_all = build_columns_index(db_uri, schema or None, all_candidates)
+                    state_hits = find_columns_containing(cols_index_all, ["state"])
+                    hint = [
+                        f"Compute the top {n_states} states by COUNT(DISTINCT pres_eid) and then restrict results to only those states.",
+                        "Use an actual state column from table_info (e.g., from persona) and JOIN as needed.",
+                        "Finally, aggregate by city and show cities with the highest counts across those states only.",
+                    ]
+                    try:
+                        if state_hits:
+                            top = []
+                            for t, cols in state_hits.items():
+                                if t in selected_tables:
+                                    top.extend([f"{t}.{c}" for c in cols[:1]])
+                            if top:
+                                hint.append("Candidate state columns: " + ", ".join(top[:3]) + ".")
+                    except Exception:
+                        pass
+                    subset_hint = "\nNote: " + " ".join(hint)
+            except Exception:
+                pass
+
             manual_inputs = {
-                "question": standalone_question,
+                "question": f"{standalone_question}{grain_hint}{metric_hint}{time_hint}{weekly_hint}{subset_hint}",
                 "table_info": table_info,
                 "top_k": int(top_k),
                 "dialect": dialect,
@@ -1159,28 +1629,91 @@ if prompt:
                     # If we couldn't heal, re-raise original error to display
                     raise
 
-            # 8) NL rephrase (with token-safety and graceful retry)
-            safe_result_str = _cap(result_str, MAX_RESULT_CHARS)
-            rephrase_answer = build_rephraser(llm)
-            try:
-                nl_answer = rephrase_answer.invoke({
-                    "question": standalone_question,
-                    "query": sql_to_run,
-                    "result": safe_result_str
-                })
-            except Exception as e:
-                if "context length" in str(e).lower() or "context_length_exceeded" in str(e).lower():
-                    # Retry with minimal context
-                    nl_answer = (answer_prompt | ChatOpenAI(model=model, temperature=temperature) | StrOutputParser()).invoke({
-                        "question": _cap(standalone_question, 400),
-                        "query": _cap(sql_to_run, 1200),
-                        "result": _cap(result_str, 3000),
-                    })
+            # 8) NL rephrase with empty-result guard (and optional zero-result retry)
+            def _is_empty(res_str: str, frame: pd.DataFrame | None) -> bool:
+                if isinstance(frame, pd.DataFrame) and frame.empty:
+                    return True
+                s = (res_str or "").strip().lower()
+                return s in ("", "[]", "()", "none")
+
+            if _is_empty(result_str, df):
+                # Attempt one self-heal: identify potentially relevant columns based on question keywords
+                # and ask the LLM to revise the SQL using those columns (if applicable).
+                words = list({w.lower() for w in re.findall(r"[A-Za-z0-9]+", standalone_question) if len(w) >= 3})
+                cols_index = build_columns_index(db_uri, schema or None, all_candidates)
+                col_hits = find_columns_containing(cols_index, words)
+                if col_hits:
+                    hints = []
+                    for t, cols in col_hits.items():
+                        hints.append(f"{t}: {', '.join(cols[:6])}")
+                    hint = (
+                        "Note: The previous query returned zero rows. Based on the question keywords, "
+                        "the following columns may be relevant for filtering: " + "; ".join(hints) + ". "
+                        "Recheck filters using only ALLOWED TABLES and columns present in table_info."
+                    )
+                    manual_inputs["question"] = f"{standalone_question}\n{hint}"
+                    sql_raw = sql_generator.invoke(manual_inputs)
+                    sql_to_run = clean_sql(sql_raw) or sql_raw
+                    if enforce_select_only and not is_select_only(sql_to_run):
+                        # fall back to empty result handling
+                        nl_answer = "No relevant records were found for this request."
+                    else:
+                        try:
+                            result_str = execute_query.invoke(sql_to_run)
+                            df = try_fetch_dataframe(sql_to_run, db_uri)
+                        except Exception:
+                            pass
+
+                if _is_empty(result_str, df):
+                    nl_answer = "No relevant records were found for this request."
                 else:
-                    raise
+                    safe_result_str = _cap(result_str, MAX_RESULT_CHARS)
+                    rephrase_answer = build_rephraser(llm)
+                    try:
+                        nl_answer = rephrase_answer.invoke({
+                            "question": standalone_question,
+                            "query": sql_to_run,
+                            "result": safe_result_str
+                        })
+                        nl_answer = _enforce_concise(nl_answer)
+                    except Exception as e:
+                        if "context length" in str(e).lower() or "context_length_exceeded" in str(e).lower():
+                            nl_answer = (answer_prompt | ChatOpenAI(model=model, temperature=temperature) | StrOutputParser()).invoke({
+                                "question": _cap(standalone_question, 400),
+                                "query": _cap(sql_to_run, 1200),
+                                "result": _cap(result_str, 3000),
+                            })
+                            nl_answer = _enforce_concise(nl_answer)
+                        else:
+                            raise
+            else:
+                safe_result_str = _cap(result_str, MAX_RESULT_CHARS)
+                rephrase_answer = build_rephraser(llm)
+                try:
+                    nl_answer = rephrase_answer.invoke({
+                        "question": standalone_question,
+                        "query": sql_to_run,
+                        "result": safe_result_str
+                    })
+                    nl_answer = _enforce_concise(nl_answer)
+                except Exception as e:
+                    if "context length" in str(e).lower() or "context_length_exceeded" in str(e).lower():
+                        # Retry with minimal context
+                        nl_answer = (answer_prompt | ChatOpenAI(model=model, temperature=temperature) | StrOutputParser()).invoke({
+                            "question": _cap(standalone_question, 400),
+                            "query": _cap(sql_to_run, 1200),
+                            "result": _cap(result_str, 3000),
+                        })
+                        nl_answer = _enforce_concise(nl_answer)
+                    else:
+                        raise
 
             # 9) Render assistant bubble with answer + details
             with st.chat_message("assistant"):
+                # Prefer deterministic short summary when we can infer it from the DataFrame
+                auto_sum = _auto_short_summary(df, standalone_question)
+                if auto_sum:
+                    nl_answer = _enforce_concise(auto_sum)
                 st.write(nl_answer)
 
                 # NEW: Visuals section (optional)
